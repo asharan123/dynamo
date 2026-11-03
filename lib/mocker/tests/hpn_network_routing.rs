@@ -1,0 +1,162 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//! Hand-built decode routing cases through the real replay and KV router.
+#![cfg(feature = "replay-bench")]
+
+use dynamo_kv_router::config::KvRouterConfig;
+use dynamo_mocker::common::protocols::{MockerConfig, WorkerType};
+use dynamo_mocker::loadgen::{MooncakeRow, Trace};
+use dynamo_mocker::replay::{
+    OfflineDisaggReplayConfig, PerRequestRecord, ReplayCaptureOptions, ReplayDeterminism,
+    ReplayRouterMode, SlaThresholds,
+    simulate_loaded_trace_disagg_with_router_mode_and_capture_options,
+};
+use serde_json::json;
+
+const BLOCK_SIZE: usize = 512;
+
+fn role(worker_type: WorkerType, workers_per_nic: usize) -> MockerConfig {
+    MockerConfig::from_value(json!({
+        "engine": {
+            "backend": "vllm",
+            "worker_type": worker_type,
+            "block_size": BLOCK_SIZE,
+            "num_gpu_blocks": 8192,
+            "max_num_batched_tokens": 131072,
+            "max_num_seqs": 32,
+            "kv_transfer_bandwidth": 25.0,
+            "kv_transfer_bytes_per_token": 320000,
+            "kv_transfer_timing_mode": "full_prompt",
+            "kv_transfer_workers_per_nic": workers_per_nic,
+        }
+    }))
+    .unwrap()
+}
+
+/// `(arrival ms, input tokens, output tokens)`, returned in arrival order.
+fn replay(
+    requests: &[(f64, usize, usize)],
+    num_decode_workers: usize,
+    decode_workers_per_nic: usize,
+    weight: f64,
+) -> Vec<PerRequestRecord> {
+    let mut next_hash = 0u64;
+    let rows = requests
+        .iter()
+        .map(|&(arrival_ms, input, output)| {
+            let blocks = input.div_ceil(BLOCK_SIZE) as u64;
+            let hash_ids = (next_hash..next_hash + blocks).collect();
+            next_hash += blocks;
+            MooncakeRow {
+                timestamp: Some(arrival_ms),
+                input_length: Some(input),
+                output_length: Some(output),
+                hash_ids: Some(hash_ids),
+                ..Default::default()
+            }
+        })
+        .collect();
+    let report = simulate_loaded_trace_disagg_with_router_mode_and_capture_options(
+        OfflineDisaggReplayConfig {
+            prefill_args: role(WorkerType::Prefill, 1),
+            decode_args: role(WorkerType::Decode, decode_workers_per_nic),
+            num_prefill_workers: requests.len(),
+            num_decode_workers,
+        },
+        Some(KvRouterConfig {
+            transfer_load_weight: weight,
+            ..Default::default()
+        }),
+        None,
+        Trace::from_mooncake_rows(rows, BLOCK_SIZE).unwrap(),
+        1.0,
+        ReplayRouterMode::KvRouter,
+        ReplayCaptureOptions {
+            capture_per_request: true,
+            determinism: ReplayDeterminism::CanonicalV1,
+            ..Default::default()
+        },
+        None,
+        SlaThresholds::default(),
+    )
+    .unwrap();
+    let mut records = report.per_request;
+    records.sort_by(|a, b| a.arrival_time_ms.total_cmp(&b.arrival_time_ms));
+    records
+}
+
+fn decode_worker(record: &PerRequestRecord) -> usize {
+    record.decode_worker_idx.expect("request reached decode")
+}
+
+/// One worker per machine. A resident long request leaves machine B heavier in
+/// blocks with an idle NIC, while machine A is lighter but receiving a transfer
+/// when the probe is routed.
+const BUSY_NIC_REQUESTS: [(f64, usize, usize); 3] = [
+    (0.0, 32_000, 4_000),
+    (2_000.0, 16_000, 4_000),
+    (2_300.0, 8_000, 8),
+];
+
+#[test]
+fn zero_weight_follows_block_load_onto_the_busy_nic() {
+    let records = replay(&BUSY_NIC_REQUESTS, 2, 1, 0.0);
+    let [resident, in_flight, probe] = records.as_slice() else {
+        panic!("expected three records");
+    };
+    assert_ne!(decode_worker(resident), decode_worker(in_flight));
+    // The probe is routed while the second request's KV is still arriving.
+    assert!(probe.source_held_ms.unwrap() < in_flight.destination_activated_ms.unwrap());
+    assert_eq!(decode_worker(probe), decode_worker(in_flight));
+}
+
+#[test]
+fn positive_weight_avoids_the_busy_nic_despite_more_blocks() {
+    let records = replay(&BUSY_NIC_REQUESTS, 2, 1, 3.0);
+    let [resident, in_flight, probe] = records.as_slice() else {
+        panic!("expected three records");
+    };
+    assert_ne!(decode_worker(resident), decode_worker(in_flight));
+    assert!(probe.source_held_ms.unwrap() < in_flight.destination_activated_ms.unwrap());
+    assert_eq!(decode_worker(probe), decode_worker(resident));
+}
+
+#[test]
+fn positive_weight_avoids_the_sibling_of_a_receiving_worker() {
+    // Three residents fill three of four workers, and the fourth takes a transfer.
+    // Moving the light resident across positions finds the arrangement where it
+    // shares a NIC with the receiving worker, which block load alone then prefers.
+    let requests = |light: usize| -> Vec<(f64, usize, usize)> {
+        let mut requests: Vec<(f64, usize, usize)> = (0..3)
+            .map(|i| {
+                let input = if i == light { 8_000 } else { 32_000 };
+                (i as f64 * 2_000.0, input, 4_000)
+            })
+            .collect();
+        requests.push((6_000.0, 16_000, 4_000));
+        requests.push((6_300.0, 8_000, 8));
+        requests
+    };
+    let same_nic = |records: &[PerRequestRecord]| {
+        let (in_flight, probe) = (&records[3], &records[4]);
+        assert!(probe.source_held_ms.unwrap() < in_flight.destination_activated_ms.unwrap());
+        decode_worker(probe) / 2 == decode_worker(in_flight) / 2
+    };
+    let light = (0..3)
+        .find(|light| same_nic(&replay(&requests(*light), 4, 2, 0.0)))
+        .expect("block load alone must choose the sibling in one arrangement");
+    assert!(!same_nic(&replay(&requests(light), 4, 2, 5.0)));
+}
+
+#[test]
+fn positive_weight_changes_nothing_on_an_idle_network() {
+    // Each request is routed long after the previous transfer finished.
+    let requests = [(0.0, 8_000, 8), (5_000.0, 8_000, 8), (10_000.0, 8_000, 8)];
+    let decode_workers = |weight| -> Vec<usize> {
+        replay(&requests, 4, 2, weight)
+            .iter()
+            .map(decode_worker)
+            .collect()
+    };
+    assert_eq!(decode_workers(0.0), decode_workers(3.0));
+}
