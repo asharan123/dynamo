@@ -50,6 +50,7 @@ struct DefaultScorer<const REQUEST_COST: bool, const SHARED_CREDIT: bool> {
     disk_cache_hit_weight: f64,
     shared_cache_multiplier: f64,
     decode_active_request_weight: f64,
+    transfer_load_weight: f64,
     prefill_load_scale: f64,
     is_decode: bool,
     is_plain_decode: bool,
@@ -115,6 +116,7 @@ impl<const REQUEST_COST: bool, const SHARED_CREDIT: bool>
             disk_cache_hit_weight: config.disk_cache_hit_weight,
             shared_cache_multiplier: config.shared_cache_multiplier,
             decode_active_request_weight: config.decode_active_request_weight,
+            transfer_load_weight: config.transfer_load_weight,
             prefill_load_scale: config.prefill_load_scale,
             is_decode: worker_label == "decode",
             is_plain_decode,
@@ -222,6 +224,13 @@ impl<const REQUEST_COST: bool, const SHARED_CREDIT: bool>
             };
             let prefill = (self.prepared.block_size.divide(raw_tokens as f64) - credit).max(0.0);
             self.prefill_load_scale * prefill + load.decode_cost_blocks() + request_cost
+        };
+        // Skipped at weight zero so the score keeps its exact unweighted value.
+        let logit = if self.transfer_load_weight != 0.0 {
+            let congestion = context.transfer_congestion(candidate.worker()).unwrap_or(0);
+            logit + self.transfer_load_weight * context.request_blocks() as f64 * congestion as f64
+        } else {
+            logit
         };
         let cost = logit * candidate.preferred_taint_multiplier().unwrap_or(1.0);
         Ok(cost)

@@ -32,6 +32,7 @@ pub(super) struct PolicyParameters {
     pub(super) overlap_score_credit_decay: f64,
     pub(super) prefill_load_scale: f64,
     pub(super) decode_active_request_weight: f64,
+    pub(super) transfer_load_weight: f64,
     pub(super) host_cache_hit_weight: f64,
     pub(super) disk_cache_hit_weight: f64,
     pub(super) shared_cache_multiplier: f64,
@@ -57,6 +58,7 @@ impl Parameters {
             decode_active_request_weight: self
                 .decode_active_request_weight
                 .unwrap_or(config.decode_active_request_weight),
+            transfer_load_weight: config.transfer_load_weight,
             host_cache_hit_weight: self
                 .host_cache_hit_weight
                 .unwrap_or(config.host_cache_hit_weight),

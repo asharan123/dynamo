@@ -692,6 +692,7 @@ struct KvRouterConfigSerde {
     overlap_score_credit_decay: f64,
     prefill_load_scale: f64,
     decode_active_request_weight: f64,
+    transfer_load_weight: f64,
     overlap_score_weight: Option<f64>,
     host_cache_hit_weight: f64,
     disk_cache_hit_weight: f64,
@@ -744,6 +745,7 @@ impl Default for KvRouterConfigSerde {
             overlap_score_credit_decay: config.overlap_score_credit_decay,
             prefill_load_scale: config.prefill_load_scale,
             decode_active_request_weight: config.decode_active_request_weight,
+            transfer_load_weight: config.transfer_load_weight,
             overlap_score_weight: None,
             host_cache_hit_weight: config.host_cache_hit_weight,
             disk_cache_hit_weight: config.disk_cache_hit_weight,
@@ -809,6 +811,12 @@ pub struct KvRouterConfig {
     /// compute matters more than resident KV footprint. Defaults to 0.0.
     #[serde(default, skip_serializing_if = "is_default")]
     pub decode_active_request_weight: f64,
+
+    /// Weight of KV transfer contention in worker cost, charged as this weight
+    /// times the request's blocks times the other transfers on the busier NIC of
+    /// the path. It applies only when the host models NICs. Defaults to 0.0.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub transfer_load_weight: f64,
 
     #[serde(default = "default_host_cache_hit_weight")]
     pub host_cache_hit_weight: f64,
@@ -997,6 +1005,7 @@ impl Default for KvRouterConfig {
             overlap_score_credit_decay: default_overlap_score_credit_decay(),
             prefill_load_scale: default_prefill_load_scale(),
             decode_active_request_weight: default_decode_active_request_weight(),
+            transfer_load_weight: 0.0,
             host_cache_hit_weight: default_host_cache_hit_weight(),
             disk_cache_hit_weight: default_disk_cache_hit_weight(),
             router_temperature: 0.0,
@@ -1062,6 +1071,7 @@ impl TryFrom<KvRouterConfigSerde> for KvRouterConfig {
             overlap_score_credit_decay: compat.overlap_score_credit_decay,
             prefill_load_scale,
             decode_active_request_weight: compat.decode_active_request_weight,
+            transfer_load_weight: compat.transfer_load_weight,
             host_cache_hit_weight: compat.host_cache_hit_weight,
             disk_cache_hit_weight: compat.disk_cache_hit_weight,
             router_temperature: compat.router_temperature,
@@ -1443,6 +1453,7 @@ impl KvRouterConfig {
             "decode_active_request_weight",
             self.decode_active_request_weight,
         )?;
+        validate_finite_non_negative("transfer_load_weight", self.transfer_load_weight)?;
         validate_range(
             "host_cache_hit_weight",
             self.host_cache_hit_weight,
@@ -2903,6 +2914,21 @@ models:
                     "{field}={value}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn transfer_load_weight_defaults_to_zero_and_rejects_invalid_values() {
+        assert_eq!(KvRouterConfig::default().transfer_load_weight, 0.0);
+        let parsed: KvRouterConfig =
+            serde_json::from_value(serde_json::json!({ "transfer_load_weight": 2.5 })).unwrap();
+        assert_eq!(parsed.transfer_load_weight, 2.5);
+        for invalid in [-1.0, f64::NAN, f64::INFINITY] {
+            let config = KvRouterConfig {
+                transfer_load_weight: invalid,
+                ..Default::default()
+            };
+            assert!(config.validate().is_err(), "{invalid}");
         }
     }
 

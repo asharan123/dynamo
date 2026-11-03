@@ -187,6 +187,7 @@ impl KvRouterConfig {
             overlap_score_credit_decay,
             prefill_load_scale,
             decode_active_request_weight,
+            transfer_load_weight: 0.0,
             host_cache_hit_weight,
             disk_cache_hit_weight,
             router_temperature,

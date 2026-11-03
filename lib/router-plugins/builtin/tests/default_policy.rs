@@ -3,6 +3,7 @@
 mod support;
 use dynamo_custom_policy_builtin::{DefaultWorkerSelector, default_policy, default_registry};
 use dynamo_kv_router::protocols::WorkerWithDpRank;
+use dynamo_kv_router::scheduling::TransferLoad;
 use dynamo_kv_router::{
     KvRouterConfig, RoutingPartitionRef, WorkerInputView, WorkerInputs, WorkerPicker,
     WorkerSelectionContext, WorkerSelectionPolicy, WorkerSelectionPolicyError, WorkerSelector,
@@ -480,4 +481,115 @@ fn shared_cache_credit_defaults_and_legacy_precedence_apply_to_selection() {
             assert_eq!(select(default_policy(config, "prefill")), expected_worker);
         }
     }
+}
+
+/// A 1600-token prompt at block size 16 is 100 blocks. Rank 0 of workers 0 and 1
+/// carry the given block loads; every other rank is priced out of contention.
+fn transfer_scoring_selection(
+    weight: f64,
+    blocks: [usize; 2],
+    transfer_load: Option<(usize, [usize; 2])>,
+) -> u64 {
+    let (workers, mut request) = fixture(2, 1600);
+    request.overlap = Default::default();
+    request.track_prefill_tokens = false;
+    for (worker, load) in &mut request.worker_loads {
+        load.active_requests = 0;
+        load.active_prefill_tokens = 0;
+        load.additional_active_blocks = 0;
+        load.active_decode_blocks = if worker.dp_rank == 0 {
+            blocks[worker.worker_id as usize]
+        } else {
+            1_000_000
+        };
+    }
+    request.transfer_load = transfer_load.map(|(sending, receiving)| TransferLoad {
+        sending,
+        receiving: (0..2u64)
+            .map(|id| (WorkerWithDpRank::new(id, 0), receiving[id as usize]))
+            .collect(),
+    });
+    let policy = default_policy(
+        KvRouterConfig {
+            overlap_score_credit: 0.0,
+            transfer_load_weight: weight,
+            ..Default::default()
+        },
+        "replay",
+    );
+    let selected = policy
+        .select_worker(support::selection_input(&workers, &request, 16))
+        .unwrap();
+    assert_eq!(selected.worker.dp_rank, 0);
+    selected.worker.worker_id
+}
+
+#[test]
+fn transfer_cost_is_weight_times_blocks_times_receive_load() {
+    // Worker 0 pays 1 * 100 * 3 = 300 for its busy NIC, so worker 1 wins with
+    // 299 blocks of its own and loses with 301.
+    assert_eq!(
+        transfer_scoring_selection(1.0, [0, 299], Some((0, [3, 0]))),
+        1
+    );
+    assert_eq!(
+        transfer_scoring_selection(1.0, [0, 301], Some((0, [3, 0]))),
+        0
+    );
+    // A send load of 1 charges worker 1 for 100 as well, leaving a margin of 200.
+    assert_eq!(
+        transfer_scoring_selection(1.0, [0, 199], Some((1, [3, 0]))),
+        1
+    );
+    assert_eq!(
+        transfer_scoring_selection(1.0, [0, 201], Some((1, [3, 0]))),
+        0
+    );
+    // The weight scales the same cost: 0.5 * 100 * 3 = 150.
+    assert_eq!(
+        transfer_scoring_selection(0.5, [0, 149], Some((0, [3, 0]))),
+        1
+    );
+    assert_eq!(
+        transfer_scoring_selection(0.5, [0, 151], Some((0, [3, 0]))),
+        0
+    );
+}
+
+#[test]
+fn busy_send_nic_charges_every_candidate_the_same() {
+    // At sending 4, both pay 400 whatever their receive loads below 4, so block
+    // load alone decides.
+    assert_eq!(
+        transfer_scoring_selection(1.0, [5, 6], Some((4, [0, 2]))),
+        0
+    );
+    assert_eq!(
+        transfer_scoring_selection(1.0, [6, 5], Some((4, [0, 2]))),
+        1
+    );
+}
+
+#[test]
+fn idle_network_and_shared_nic_leave_block_load_to_decide() {
+    assert_eq!(
+        transfer_scoring_selection(1.0, [6, 5], Some((0, [0, 0]))),
+        1
+    );
+    // Two candidates on one NIC see one receive load.
+    assert_eq!(
+        transfer_scoring_selection(1.0, [6, 5], Some((0, [3, 3]))),
+        1
+    );
+}
+
+#[test]
+fn transfer_cost_needs_both_a_weight_and_nic_load() {
+    // Without the weight, the lighter worker wins despite its busy NIC.
+    assert_eq!(
+        transfer_scoring_selection(0.0, [0, 1], Some((0, [50, 0]))),
+        0
+    );
+    // A selection without NIC load, such as prefill, ignores the weight.
+    assert_eq!(transfer_scoring_selection(1.0, [0, 1], None), 0);
 }
