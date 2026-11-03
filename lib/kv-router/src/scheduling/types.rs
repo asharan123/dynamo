@@ -586,7 +586,7 @@ impl SchedulingRequest {
         self.worker_loads.get(&worker).copied().unwrap_or_default()
     }
 
-    pub(crate) fn request_blocks(&self, block_size: u32) -> u64 {
+    pub fn request_blocks(&self, block_size: u32) -> u64 {
         self.isl_tokens.div_ceil(block_size as usize) as u64
     }
 

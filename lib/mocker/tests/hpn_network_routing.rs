@@ -11,12 +11,16 @@ use dynamo_mocker::replay::{
     ReplayRouterMode, SlaThresholds,
     simulate_loaded_trace_disagg_with_router_mode_and_capture_options,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 
 const BLOCK_SIZE: usize = 512;
 
-fn role(worker_type: WorkerType, workers_per_nic: usize) -> MockerConfig {
-    MockerConfig::from_value(json!({
+fn role(
+    worker_type: WorkerType,
+    workers_per_nic: usize,
+    startup_time_s: Option<f64>,
+) -> MockerConfig {
+    let mut config = MockerConfig::from_value(json!({
         "engine": {
             "backend": "vllm",
             "worker_type": worker_type,
@@ -30,7 +34,9 @@ fn role(worker_type: WorkerType, workers_per_nic: usize) -> MockerConfig {
             "kv_transfer_workers_per_nic": workers_per_nic,
         }
     }))
-    .unwrap()
+    .unwrap();
+    config.startup_time = startup_time_s;
+    config
 }
 
 /// `(arrival ms, input tokens, output tokens)`, returned in arrival order.
@@ -39,6 +45,25 @@ fn replay(
     num_decode_workers: usize,
     decode_workers_per_nic: usize,
     weight: f64,
+) -> Vec<PerRequestRecord> {
+    replay_with(
+        requests,
+        num_decode_workers,
+        decode_workers_per_nic,
+        None,
+        KvRouterConfig {
+            transfer_load_weight: weight,
+            ..Default::default()
+        },
+    )
+}
+
+fn replay_with(
+    requests: &[(f64, usize, usize)],
+    num_decode_workers: usize,
+    decode_workers_per_nic: usize,
+    decode_startup_time_s: Option<f64>,
+    router_config: KvRouterConfig,
 ) -> Vec<PerRequestRecord> {
     let mut next_hash = 0u64;
     let rows = requests
@@ -58,15 +83,16 @@ fn replay(
         .collect();
     let report = simulate_loaded_trace_disagg_with_router_mode_and_capture_options(
         OfflineDisaggReplayConfig {
-            prefill_args: role(WorkerType::Prefill, 1),
-            decode_args: role(WorkerType::Decode, decode_workers_per_nic),
+            prefill_args: role(WorkerType::Prefill, 1, None),
+            decode_args: role(
+                WorkerType::Decode,
+                decode_workers_per_nic,
+                decode_startup_time_s,
+            ),
             num_prefill_workers: requests.len(),
             num_decode_workers,
         },
-        Some(KvRouterConfig {
-            transfer_load_weight: weight,
-            ..Default::default()
-        }),
+        Some(router_config),
         None,
         Trace::from_mooncake_rows(rows, BLOCK_SIZE).unwrap(),
         1.0,
@@ -159,4 +185,96 @@ fn positive_weight_changes_nothing_on_an_idle_network() {
             .collect()
     };
     assert_eq!(decode_workers(0.0), decode_workers(3.0));
+}
+
+fn read_decisions(path: &std::path::Path) -> Vec<Value> {
+    std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+fn logging_config(log: &std::path::Path, weight: f64) -> KvRouterConfig {
+    KvRouterConfig {
+        transfer_load_weight: weight,
+        transfer_decision_log: Some(log.to_str().unwrap().to_string()),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn decision_log_explains_every_decode_decision() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("decisions.jsonl");
+    let records = replay_with(&BUSY_NIC_REQUESTS, 2, 1, None, logging_config(&log, 3.0));
+    let decisions = read_decisions(&log);
+    assert_eq!(decisions.len(), records.len());
+    for record in &records {
+        let decision = decisions
+            .iter()
+            .find(|decision| decision["request_id"] == record.uuid.as_str())
+            .expect("every request has a decision");
+        assert_eq!(
+            decision["source_rank"].as_u64().unwrap() as usize,
+            record.prefill_worker_idx.unwrap()
+        );
+        assert_eq!(
+            decision["selected_rank"].as_u64().unwrap() as usize,
+            decode_worker(record)
+        );
+        assert!(decision["time_ms"].as_f64().unwrap() >= record.source_held_ms.unwrap() - 1e-6);
+        assert!(decision["source_nic"].is_u64() && decision["sending"].is_u64());
+
+        let candidates = decision["candidates"].as_array().unwrap();
+        assert_eq!(candidates.len(), 2);
+        for candidate in candidates {
+            for field in [
+                "rank",
+                "nic",
+                "decode_blocks",
+                "active_requests",
+                "receiving",
+                "network_cost",
+                "total_cost",
+            ] {
+                assert!(candidate[field].is_number(), "{field}: {candidate}");
+            }
+        }
+        // The logged costs must explain the choice the real scorer made.
+        let lowest = candidates
+            .iter()
+            .map(|candidate| candidate["total_cost"].as_f64().unwrap())
+            .fold(f64::INFINITY, f64::min);
+        let selected = candidates
+            .iter()
+            .find(|candidate| candidate["rank"] == decision["selected_rank"])
+            .expect("selected rank is a candidate");
+        assert_eq!(selected["total_cost"].as_f64().unwrap(), lowest);
+    }
+    // The probe routed during the second request's transfer saw it on that NIC.
+    let probe = &decisions[2];
+    let busy_rank = decode_worker(&records[1]) as u64;
+    let busy = probe["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|candidate| candidate["rank"].as_u64() == Some(busy_rank))
+        .unwrap();
+    assert_eq!(busy["receiving"].as_u64(), Some(1));
+}
+
+#[test]
+fn decision_log_does_not_change_the_replay() {
+    let dir = tempfile::tempdir().unwrap();
+    let requests = serde_json::to_string(&replay(&BUSY_NIC_REQUESTS, 2, 1, 3.0)).unwrap();
+    let logged = serde_json::to_string(&replay_with(
+        &BUSY_NIC_REQUESTS,
+        2,
+        1,
+        None,
+        logging_config(&dir.path().join("decisions.jsonl"), 3.0),
+    ))
+    .unwrap();
+    assert_eq!(requests, logged);
 }

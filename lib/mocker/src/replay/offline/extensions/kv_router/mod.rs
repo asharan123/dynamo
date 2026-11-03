@@ -5,6 +5,8 @@ use dynamo_custom_policy_builtin::DefaultWorkerSelector;
 use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
+use std::fs::File;
+use std::io::{LineWriter, Write};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -202,6 +204,30 @@ pub(crate) struct WorkerAdmission {
 #[derive(Debug, Default)]
 pub(crate) struct RouterEffects {
     admissions: Vec<WorkerAdmission>,
+}
+
+/// One decode decision, written when `transfer_decision_log` is set.
+#[derive(serde::Serialize)]
+struct TransferDecision {
+    time_ms: f64,
+    request_id: String,
+    source_rank: usize,
+    source_nic: usize,
+    sending: usize,
+    selected_rank: usize,
+    candidates: Vec<TransferDecisionCandidate>,
+}
+
+/// Cost terms of one candidate, in blocks and matching the plain decode score.
+#[derive(serde::Serialize)]
+struct TransferDecisionCandidate {
+    rank: usize,
+    nic: usize,
+    decode_blocks: usize,
+    active_requests: usize,
+    receiving: usize,
+    network_cost: f64,
+    total_cost: f64,
 }
 
 /// Internal result of a successful ``admit_request`` call: the chosen
@@ -431,6 +457,8 @@ pub(crate) struct OfflineReplayRouter {
     prefill_load_estimator: Option<ReplayPrefillLoadEstimator>,
     /// Live NIC load, bound on the decode router when the replay models NICs.
     transfer_load: Option<TransferLoadView>,
+    /// Opened at the first decision, so only the NIC-aware decode router writes.
+    transfer_decision_log: Option<LineWriter<File>>,
     decay_time_epoch: Instant,
     tracking_hash: TrackingHashContext,
     /// Simulated delay before KV events reach the indexer; `0.0` applies them synchronously.
@@ -682,6 +710,7 @@ impl OfflineReplayRouter {
             indexer: SyncReplayIndexer::new(args.block_size as u32),
             prefill_load_estimator,
             transfer_load: None,
+            transfer_decision_log: None,
             // This is only a base Instant for converting replay `now_ms` values into
             // synthetic `Instant`s. All subsequent decay/accounting uses virtual replay
             // time derived from this epoch, not wall-clock progression.
@@ -1120,6 +1149,12 @@ impl OfflineReplayRouter {
             .checked_mul(self.dp_size as usize)
             .and_then(|base| base.checked_add(dp_rank))
             .ok_or_else(|| anyhow!("selected worker/rank index overflow"))?;
+        self.log_transfer_decision(
+            &request,
+            &scheduling_request,
+            worker_idx,
+            decay_now.duration_since(self.decay_time_epoch),
+        )?;
         let request_id = request.request_id();
         let prefill_load_hint = self.prefill_load_hint_for(
             request.isl_tokens,
@@ -1152,6 +1187,73 @@ impl OfflineReplayRouter {
             best_available_overlap_blocks,
             isl_blocks,
         })
+    }
+
+    fn log_transfer_decision(
+        &mut self,
+        request: &PendingRequest,
+        scheduling_request: &SchedulingRequest,
+        selected_rank: usize,
+        elapsed: Duration,
+    ) -> Result<()> {
+        let (Some(path), Some(view), Some(load), Some(source_rank)) = (
+            self.config.transfer_decision_log.as_deref(),
+            self.transfer_load.as_ref(),
+            scheduling_request.transfer_load.as_ref(),
+            request.transfer_source,
+        ) else {
+            return Ok(());
+        };
+        let request_blocks = scheduling_request.request_blocks(self.block_size) as f64;
+        let mut candidates: Vec<_> = load
+            .receiving
+            .iter()
+            .map(|(worker, receiving)| {
+                let rank =
+                    worker.worker_id as usize * self.dp_size as usize + worker.dp_rank as usize;
+                let projection = scheduling_request
+                    .worker_loads
+                    .get(worker)
+                    .copied()
+                    .unwrap_or_default();
+                let network_cost = self.config.transfer_load_weight
+                    * request_blocks
+                    * load.congestion(*worker) as f64;
+                let decode_blocks = projection.potential_decode_blocks();
+                TransferDecisionCandidate {
+                    rank,
+                    nic: view.receive_nic(rank),
+                    decode_blocks,
+                    active_requests: projection.active_requests,
+                    receiving: *receiving,
+                    network_cost,
+                    total_cost: decode_blocks as f64
+                        + self.config.decode_active_request_weight
+                            * projection.active_requests as f64
+                        + network_cost,
+                }
+            })
+            .collect();
+        candidates.sort_by_key(|candidate| candidate.rank);
+        let decision = TransferDecision {
+            time_ms: elapsed.as_secs_f64() * 1000.0,
+            request_id: request.request_id(),
+            source_rank,
+            source_nic: view.send_nic(source_rank),
+            sending: load.sending,
+            selected_rank,
+            candidates,
+        };
+        let mut line = serde_json::to_vec(&decision)?;
+        line.push(b'\n');
+        let writer = match &mut self.transfer_decision_log {
+            Some(writer) => writer,
+            log => log.insert(LineWriter::new(File::create(path).with_context(|| {
+                format!("failed to create transfer decision log {path}")
+            })?)),
+        };
+        writer.write_all(&line)?;
+        Ok(())
     }
 
     /// Read NIC load at selection time, so a queued request sees the load at
