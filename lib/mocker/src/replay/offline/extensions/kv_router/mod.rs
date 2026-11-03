@@ -23,7 +23,7 @@ use dynamo_kv_router::protocols::{
 use dynamo_kv_router::queue::DEFAULT_MAX_BATCHED_TOKENS;
 use dynamo_kv_router::scheduling::{
     OverlapAnalysis, OverlapSignals, PolicyClassConfig, PolicyProfile, PolicyQueue, QueueSnapshot,
-    ScheduleMode, WorkerPlacement,
+    ScheduleMode, TransferLoad, WorkerPlacement,
 };
 use dynamo_kv_router::sequences::topology::WorkerDpRange;
 use dynamo_kv_router::{
@@ -49,7 +49,7 @@ use crate::replay::router_shared::{
 use aisimulate_core::replay::loadgen::{ReplayRequestHashes, ReplayRequestPayload};
 use aisimulate_core::replay::{
     Placement, PlacementCacheSample, PlacementDecision, PlacementEffects, PlacementPolicy,
-    ProviderSpec, ReplayAdmissionMetadata, WorkerTopology,
+    ProviderSpec, ReplayAdmissionMetadata, TransferLoadView, WorkerTopology,
 };
 
 mod composition;
@@ -159,6 +159,7 @@ pub(in crate::replay) fn provider_spec() -> ProviderSpec {
 pub(in crate::replay) struct KvReplayMetadata {
     hashes: Option<ReplayRequestHashes>,
     max_output_tokens_override: Option<usize>,
+    transfer_source: Option<usize>,
 }
 
 impl ReplayAdmissionMetadata for KvReplayMetadata {
@@ -166,6 +167,7 @@ impl ReplayAdmissionMetadata for KvReplayMetadata {
         Self {
             hashes,
             max_output_tokens_override: None,
+            transfer_source: None,
         }
     }
 
@@ -180,6 +182,11 @@ impl ReplayAdmissionMetadata for KvReplayMetadata {
 
     fn into_hashes(self) -> Option<ReplayRequestHashes> {
         self.hashes
+    }
+
+    fn with_transfer_source(mut self, prefill_rank: Option<usize>) -> Self {
+        self.transfer_source = prefill_rank;
+        self
     }
 }
 
@@ -363,6 +370,8 @@ struct PendingRequest {
     strict_priority: u32,
     policy_class: Option<String>,
     session_id: Option<String>,
+    /// Prefill rank this decode request's KV leaves from.
+    transfer_source: Option<usize>,
 }
 
 impl PendingRequest {
@@ -377,6 +386,7 @@ impl PendingRequest {
         worker_loads: FxHashMap<WorkerWithDpRank, WorkerLoadProjection>,
     ) -> SchedulingRequest {
         SchedulingRequest {
+            transfer_load: None,
             mode: ScheduleMode::Tracked {
                 request_id: self.request_id(),
             },
@@ -419,6 +429,8 @@ pub(crate) struct OfflineReplayRouter {
     pending: PolicyQueue<PendingRequest>,
     indexer: SyncReplayIndexer,
     prefill_load_estimator: Option<ReplayPrefillLoadEstimator>,
+    /// Live NIC load, bound on the decode router when the replay models NICs.
+    transfer_load: Option<TransferLoadView>,
     decay_time_epoch: Instant,
     tracking_hash: TrackingHashContext,
     /// Simulated delay before KV events reach the indexer; `0.0` applies them synchronously.
@@ -551,11 +563,13 @@ impl<Request: PlacementRequestView> PlacementPolicy<Request> for KvRouterPlaceme
         let request_id = request_metadata
             .uuid
             .ok_or_else(|| anyhow!("KV placement requires a request UUID"))?;
+        let transfer_source = metadata.transfer_source;
         let admissions = self
             .router
             .on_compact_request_arrival_for_session(
                 request,
                 max_output_tokens,
+                transfer_source,
                 metadata.into_hashes(),
                 session_id,
                 now_ms,
@@ -577,6 +591,10 @@ impl<Request: PlacementRequestView> PlacementPolicy<Request> for KvRouterPlaceme
     fn observe(&mut self, observation: RouterEventBatch, now_ms: f64) -> Result<Vec<Placement>> {
         let effects = self.router.on_kv_events_at(observation.0, now_ms)?;
         Ok(self.placements(effects.admissions))
+    }
+
+    fn bind_transfer_load(&mut self, load: TransferLoadView) {
+        self.router.transfer_load = Some(load);
     }
 
     fn cancel_pending(&mut self, request_id: Uuid) -> bool {
@@ -663,6 +681,7 @@ impl OfflineReplayRouter {
             pending: PolicyQueue::new(profile),
             indexer: SyncReplayIndexer::new(args.block_size as u32),
             prefill_load_estimator,
+            transfer_load: None,
             // This is only a base Instant for converting replay `now_ms` values into
             // synthetic `Instant`s. All subsequent decay/accounting uses virtual replay
             // time derived from this epoch, not wall-clock progression.
@@ -716,6 +735,7 @@ impl OfflineReplayRouter {
         self.on_compact_request_arrival_for_session(
             request,
             request.effective_max_output_tokens(),
+            None,
             replay_hashes,
             session_id,
             now_ms,
@@ -726,13 +746,15 @@ impl OfflineReplayRouter {
         &mut self,
         request: &Request,
         max_output_tokens: usize,
+        transfer_source: Option<usize>,
         replay_hashes: Option<ReplayRequestHashes>,
         session_id: Option<String>,
         now_ms: f64,
     ) -> Result<RouterEffects> {
         self.apply_due_kv_events(now_ms)?;
-        let pending =
+        let mut pending =
             self.build_pending_request(request, max_output_tokens, replay_hashes, session_id)?;
+        pending.transfer_source = transfer_source;
         let decay_now = self.decay_now(now_ms);
         let (class_index, snapshot) = match self
             .profile
@@ -1045,6 +1067,7 @@ impl OfflineReplayRouter {
             strict_priority,
             policy_class: request.policy_class.clone(),
             session_id,
+            transfer_source: None,
         })
     }
 
@@ -1064,6 +1087,7 @@ impl OfflineReplayRouter {
             .slots
             .project_worker_loads(request.token_seq.as_deref(), decay_now);
         let mut scheduling_request = request.scheduling_request(worker_loads);
+        scheduling_request.transfer_load = self.transfer_load_for(request.transfer_source);
         let eligibility = scheduling_request.eligibility();
         // Best and selected overlap use the same weighted, rounded blocks as
         // the production router's overlap metric.
@@ -1127,6 +1151,27 @@ impl OfflineReplayRouter {
             overlap_blocks,
             best_available_overlap_blocks,
             isl_blocks,
+        })
+    }
+
+    /// Read NIC load at selection time, so a queued request sees the load at
+    /// its release rather than at its arrival.
+    fn transfer_load_for(&self, source: Option<usize>) -> Option<TransferLoad> {
+        let (load, source) = (self.transfer_load.as_ref()?, source?);
+        let dp_size = self.dp_size as usize;
+        let mut receiving = FxHashMap::default();
+        for worker_id in self.workers_with_configs.keys() {
+            for dp_rank in 0..self.dp_size {
+                let rank = *worker_id as usize * dp_size + dp_rank as usize;
+                receiving.insert(
+                    WorkerWithDpRank::new(*worker_id, dp_rank),
+                    load.receiving(rank),
+                );
+            }
+        }
+        Some(TransferLoad {
+            sending: load.sending(source),
+            receiving,
         })
     }
 

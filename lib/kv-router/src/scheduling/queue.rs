@@ -2621,6 +2621,7 @@ mod tests {
     ) {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let req = SchedulingRequest {
+            transfer_load: None,
             mode: ScheduleMode::Tracked {
                 request_id: request_id.to_string(),
             },

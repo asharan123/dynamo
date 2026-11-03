@@ -103,6 +103,7 @@ where
             shared_cache_hits,
         } = request;
         let request = SchedulingRequest {
+            transfer_load: None,
             mode,
             token_seq,
             isl_tokens,

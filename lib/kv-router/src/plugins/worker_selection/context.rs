@@ -38,6 +38,15 @@ impl WorkerSelectionContext<'_> {
         self.request_blocks
     }
 
+    /// Other KV transfers on the busier NIC of the path to `worker`, or `None`
+    /// when the host does not model NICs for this selection.
+    pub fn transfer_congestion(&self, worker: WorkerWithDpRank) -> Option<usize> {
+        self.request
+            .transfer_load
+            .as_ref()
+            .map(|load| load.congestion(worker))
+    }
+
     /// Return the number of tokens in one KV block.
     pub fn block_size(&self) -> u32 {
         self.block_size

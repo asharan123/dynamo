@@ -135,6 +135,7 @@ mod tests {
 
     fn request(target: WorkerWithDpRank) -> SchedulingRequest {
         SchedulingRequest {
+            transfer_load: None,
             mode: ScheduleMode::QueryOnly {
                 request_id: Some("request".into()),
             },

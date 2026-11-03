@@ -52,7 +52,10 @@ fn role_config(experiment: &Experiment, worker_type: WorkerType) -> Result<Mocke
         WorkerType::Prefill => experiment.prefill_engine.clone(),
         _ => experiment.decode_engine.clone(),
     });
-    engine.insert("worker_type".to_string(), serde_json::to_value(worker_type)?);
+    engine.insert(
+        "worker_type".to_string(),
+        serde_json::to_value(worker_type)?,
+    );
     engine.insert("block_size".to_string(), json!(experiment.block_size));
     MockerConfig::from_value(json!({ "engine": engine }))
 }

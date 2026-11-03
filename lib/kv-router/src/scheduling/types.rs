@@ -419,6 +419,24 @@ pub struct ScheduleRequest {
     pub shared_cache_hits: Option<SharedCacheHits>,
 }
 
+/// Host NIC contention visible to one decode decision.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TransferLoad {
+    /// Transfers sending through the NIC this request's KV will leave from.
+    pub sending: usize,
+    /// Transfers receiving through each candidate worker's NIC.
+    pub receiving: FxHashMap<WorkerWithDpRank, usize>,
+}
+
+impl TransferLoad {
+    /// Other transfers on the busier NIC of the path through `worker`. A transfer
+    /// alone on its NICs takes `1 + congestion` times as long at equal shares.
+    pub fn congestion(&self, worker: WorkerWithDpRank) -> usize {
+        self.sending
+            .max(self.receiving.get(&worker).copied().unwrap_or(0))
+    }
+}
+
 /// Actor-owned admission request.
 ///
 /// After enqueue, the caller retains only the response receiver while the
@@ -454,6 +472,8 @@ pub struct SchedulingRequest {
 
     // Load state computed during admission.
     pub worker_loads: FxHashMap<WorkerWithDpRank, WorkerLoadProjection>,
+    /// NIC contention, when the host models shared NICs for this decision.
+    pub transfer_load: Option<TransferLoad>,
 
     /// Sender half of the admission ownership handoff. For tracked requests,
     /// the actor must book before sending and undo the booking if delivery fails.
@@ -624,6 +644,7 @@ mod tests {
         );
 
         SchedulingRequest {
+            transfer_load: None,
             mode: ScheduleMode::QueryOnly {
                 request_id: Some("test".into()),
             },
