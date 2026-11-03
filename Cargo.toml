@@ -231,3 +231,7 @@ lto = "thin"
 inherits = "release"
 debug = true
 strip = false
+
+# HPN_Final: build replay against the local AISimulate checkout.
+[patch.crates-io]
+aisimulate-core = { path = "../aisimulate/crates/core" }

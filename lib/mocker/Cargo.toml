@@ -55,6 +55,10 @@ rustc-hash = "2"
 [target.'cfg(target_os = "linux")'.dependencies]
 tokio-timerfd = "0.2"
 
+[[example]]
+name = "hpn_replay"
+required-features = ["replay-bench"]
+
 [dev-dependencies]
 dynamo-kv-router = { workspace = true, features = ["metrics"] }
 rstest = "0.18.2"
