@@ -100,10 +100,42 @@ fn stats(mut values: Vec<f64>) -> Value {
     })
 }
 
-/// Handoff time from source hold to destination activation. It equals the
-/// transfer time when the destination is reserved without waiting.
+/// Handoff time from source hold to destination activation. It is
+/// `reserve_wait_ms + transfer_ms`.
 fn handoff_ms(record: &PerRequestRecord) -> Option<f64> {
     Some(record.destination_activated_ms? - record.source_held_ms?)
+}
+
+/// Time a finished prefill waits for a decode destination to reserve memory.
+fn reserve_wait_ms(record: &PerRequestRecord) -> Option<f64> {
+    Some(record.destination_reserved_ms? - record.source_held_ms?)
+}
+
+/// Time the KV transfer spends on the NICs, from reservation to activation.
+fn transfer_ms(record: &PerRequestRecord) -> Option<f64> {
+    Some(record.destination_activated_ms? - record.destination_reserved_ms?)
+}
+
+/// Token-weighted achieved hit rates. `prefill` is the share of prompt tokens
+/// the prefill worker reused from its cache. `decode_destination` is the share
+/// the decode destination already held, so it did not have to receive them.
+/// Each row is `(input_length, reused_input_tokens, destination_missing_tokens)`.
+fn hit_rates(rows: impl Iterator<Item = (usize, usize, Option<usize>)>) -> Value {
+    let (mut input, mut reused) = (0usize, 0usize);
+    let (mut handed_off, mut missing) = (0usize, 0usize);
+    for (input_length, reused_tokens, missing_tokens) in rows {
+        input += input_length;
+        reused += reused_tokens;
+        if let Some(missing_tokens) = missing_tokens {
+            handed_off += input_length;
+            missing += missing_tokens;
+        }
+    }
+    let share = |part: usize, whole: usize| (whole > 0).then(|| part as f64 / whole as f64);
+    json!({
+        "prefill": share(reused, input),
+        "decode_destination": share(missing, handed_off).map(|m| 1.0 - m),
+    })
 }
 
 /// Readmission totals per pool. A readmission is a preempt-and-readmit; the
@@ -152,6 +184,11 @@ fn write_outputs(
         "itl_ms": stats(records.iter().filter_map(|r| r.itl_ms).collect()),
         "e2e_ms": stats(records.iter().filter_map(|r| r.e2e_latency_ms).collect()),
         "handoff_ms": stats(records.iter().filter_map(|r| handoff_ms(r)).collect()),
+        "reserve_wait_ms": stats(records.iter().filter_map(|r| reserve_wait_ms(r)).collect()),
+        "transfer_ms": stats(records.iter().filter_map(|r| transfer_ms(r)).collect()),
+        "hit_rate": hit_rates(records.iter().map(|r| {
+            (r.input_length, r.reused_input_tokens, r.destination_missing_tokens)
+        })),
         "readmissions": readmissions(records.iter().map(|r| r.admission_history.as_slice())),
     });
     fs::write(
@@ -261,6 +298,27 @@ mod tests {
         assert_eq!(
             readmissions(std::iter::empty()),
             json!({"prefill": 0, "decode": 0, "requests_readmitted": 0})
+        );
+    }
+
+    #[test]
+    fn hit_rates_are_token_weighted() {
+        let rows = [
+            (1000, 500, Some(1000)),
+            (3000, 3000, Some(0)),
+            (1000, 0, None),
+        ];
+        assert_eq!(
+            hit_rates(rows.into_iter()),
+            json!({"prefill": 0.7, "decode_destination": 0.75})
+        );
+    }
+
+    #[test]
+    fn hit_rates_without_tokens_are_null() {
+        assert_eq!(
+            hit_rates(std::iter::empty()),
+            json!({"prefill": null, "decode_destination": null})
         );
     }
 }
