@@ -35,8 +35,10 @@ lib/mocker/examples/hpn_calibration/run_hpn.sh lib/mocker/examples/hpn_calibrati
 ```
 
 The first run builds `<root>/.hpn-venv` with `uv sync --frozen` against
-`aisimulate/python/aisimulate/uv.lock`. On an M-series Mac this took about 5
-minutes, including the Rust build. Later runs reuse the venv. `run_hpn.sh` records the
+`aisimulate/python/aisimulate/uv.lock`. From a fresh clone on an M-series Mac,
+the first run took about 15 minutes: the venv build plus a cold release build
+of the harness. It takes about 5 minutes when cargo's build cache is already
+warm. Later runs reuse the venv. `run_hpn.sh` records the
 aisimulate commit in `<venv>.source` and rebuilds when it changes, or on every
 run while the aisimulate checkout has uncommitted changes, because uv cannot
 detect Rust-only edits to the editable package. Set `HPN_VENV` to put the venv
@@ -44,9 +46,11 @@ somewhere else. The script refuses to sync into an existing directory it did
 not create.
 
 The template replays one 16K-token request. The run writes `run/summary.json`,
-`run/requests.jsonl` and `run/timing.json`, which records each role's resolved
-perf-model config and provenance. Expect a prefill of 1578.25 ms
-(`source_held_ms - prefill_admit_ms`) and a 171.80 ms handoff. To run your own
+`run/requests.jsonl` and `run/timing.json`. `timing.json` records each role's
+resolved perf-model config and provenance, and under `sources` the dynamo and
+aisimulate commits behind the run (`-dirty` when a checkout had uncommitted
+changes). With aisimulate `HPN_Final` at `33bc0318`, expect a prefill of
+1578.25 ms (`source_held_ms - prefill_admit_ms`) and a 171.80 ms handoff. To run your own
 workload, copy the template and change `trace`, `out_dir` and the worker counts.
 
 ## Check the environment
@@ -89,5 +93,6 @@ larger activation reserve.
 - When a decode worker preempts a request and recomputes its prompt, the mock
   charges no time for the recompute. `summary.json` reports preemptions as
   `readmissions`.
-- Only macOS arm64 has been tested. Linux should work because uv's managed
-  Python ships a shared libpython, but it is untested.
+- Only macOS arm64 has been tested. On Linux the binary links libpython by
+  name, so `run_hpn.sh` adds the venv Python's library directory to
+  `LD_LIBRARY_PATH`. That path is untested.

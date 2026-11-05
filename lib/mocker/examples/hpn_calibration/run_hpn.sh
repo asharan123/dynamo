@@ -46,7 +46,8 @@ commit="$(git -C "$ais_root" rev-parse HEAD 2>/dev/null)" ||
 source_id="$commit"
 [[ -z "$(git -C "$ais_root" status --porcelain -- crates python)" ]] || source_id="$commit-dirty"
 
-if [[ "$(cat "$stamp" 2>/dev/null)" != "$commit" || $source_id != "$commit" ]]; then
+if [[ ! -x $venv/bin/python || "$(cat "$stamp" 2>/dev/null)" != "$commit" ||
+    $source_id != "$commit" ]]; then
     if [[ -e $venv && ! -f $stamp ]]; then
         die "$venv exists but was not created by run_hpn.sh; remove it or set HPN_VENV"
     fi
@@ -59,11 +60,28 @@ if [[ "$(cat "$stamp" 2>/dev/null)" != "$commit" || $source_id != "$commit" ]]; 
 fi
 
 python="$venv/bin/python"
-"$python" -c 'import aisimulate_core.sdk' ||
-    die "the venv at $venv cannot import aisimulate_core; delete it and rerun"
+# -E ignores PYTHONPATH and PYTHONHOME from the caller's shell, so neither the
+# check nor the module path below can pick up another aisimulate checkout.
+if ! "$python" -E -c 'import aisimulate_core.sdk'; then
+    echo "stale" >"$stamp"
+    die "the venv at $venv cannot import aisimulate_core; rerun to rebuild it"
+fi
 # The embedded interpreter does not activate the venv or read its .pth files,
-# so hand it the venv's resolved module path (this replaces any PYTHONPATH).
-pythonpath="$("$python" -c 'import sys; print(":".join(p for p in sys.path[1:] if p))')"
+# so hand it exactly the venv's resolved module path.
+pythonpath="$("$python" -E -c 'import sys; print(":".join(p for p in sys.path[1:] if p))')"
+unset PYTHONHOME
+
+# On Linux the binary links libpython by name only, and cargo run does not add
+# the uv Python's lib directory to the loader path. macOS links it by full path.
+if [[ "$(uname -s)" == Linux ]]; then
+    libdir="$("$python" -E -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')"
+    export LD_LIBRARY_PATH="$libdir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
+
+# Recorded in timing.json so every run names the sources that produced it.
+dynamo_source="$(git -C "$dynamo_root" rev-parse HEAD)"
+[[ -z "$(git -C "$dynamo_root" status --porcelain)" ]] || dynamo_source="$dynamo_source-dirty"
+export HPN_AISIMULATE_SOURCE="$source_id" HPN_DYNAMO_SOURCE="$dynamo_source"
 
 cd "$dynamo_root"
 PYO3_PYTHON="$python" PYTHONPATH="$pythonpath" \

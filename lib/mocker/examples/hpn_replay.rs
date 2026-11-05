@@ -12,7 +12,8 @@
 //!
 //! A role whose engine `timing_model` uses provider `"ais"` is timed live by the
 //! AISimulate perf model (feature `ais-live`), and the run also writes
-//! `timing.json` with each such role's resolved model identity. Use
+//! `timing.json` with each such role's resolved model identity and the source
+//! commits `run_hpn.sh` exports. Use
 //! `examples/hpn_calibration/run_hpn.sh` for that path.
 
 use std::fs;
@@ -181,8 +182,13 @@ fn main() -> Result<()> {
 
     let (prefill_args, prefill_timing) = role_config(&experiment, WorkerType::Prefill, base)?;
     let (decode_args, decode_timing) = role_config(&experiment, WorkerType::Decode, base)?;
-    let timing = (prefill_timing.is_some() || decode_timing.is_some())
-        .then(|| json!({ "prefill": prefill_timing, "decode": decode_timing }));
+    let timing = (prefill_timing.is_some() || decode_timing.is_some()).then(|| {
+        json!({
+            "sources": ais_timing::source_identity(|key| std::env::var(key).ok()),
+            "prefill": prefill_timing,
+            "decode": decode_timing,
+        })
+    });
     let config = OfflineDisaggReplayConfig {
         prefill_args,
         decode_args,

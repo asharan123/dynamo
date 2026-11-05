@@ -68,6 +68,15 @@ pub fn resolve_systems_paths(engine: &mut Map<String, Value>, base: &Path) -> Re
     Ok(())
 }
 
+/// Source checkouts behind a run, as exported by `run_hpn.sh`
+/// (`<commit>` or `<commit>-dirty`). Missing values are recorded as null.
+pub fn source_identity(lookup: impl Fn(&str) -> Option<String>) -> Value {
+    serde_json::json!({
+        "aisimulate": lookup("HPN_AISIMULATE_SOURCE"),
+        "dynamo": lookup("HPN_DYNAMO_SOURCE"),
+    })
+}
+
 /// Replaces the role's perf model with the live AIS estimator when the role
 /// asks for one. Returns the resolved identity to record next to the outputs.
 pub fn install(args: &mut MockerConfig) -> Result<Option<Value>> {
@@ -324,6 +333,23 @@ mod tests {
         config["systems_paths"] = json!([3]);
         let mut engine = ais_engine(config);
         assert!(resolve_systems_paths(&mut engine, Path::new("/exp")).is_err());
+    }
+
+    #[test]
+    fn source_identity_records_exported_commits() {
+        let env = |key: &str| match key {
+            "HPN_AISIMULATE_SOURCE" => Some("33bc0318-dirty".to_string()),
+            "HPN_DYNAMO_SOURCE" => Some("d7cf9921".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            source_identity(env),
+            json!({"aisimulate": "33bc0318-dirty", "dynamo": "d7cf9921"})
+        );
+        assert_eq!(
+            source_identity(|_| None),
+            json!({"aisimulate": null, "dynamo": null})
+        );
     }
 
     #[test]
