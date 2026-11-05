@@ -18,12 +18,10 @@ fn ais_config_mut(engine: &mut Map<String, Value>) -> Result<Option<&mut Map<Str
     let Some(timing) = engine.get_mut("timing_model") else {
         return Ok(None);
     };
-    let is_ais = matches!(
-        timing.get("provider").and_then(Value::as_str),
-        Some("ais" | "aic")
-    );
-    if !is_ais {
-        return Ok(None);
+    match timing.get("provider").and_then(Value::as_str) {
+        Some("ais") => {}
+        Some("aic") => bail!("timing_model provider \"aic\" is a retired name; use \"ais\""),
+        _ => return Ok(None),
     }
     match timing.get_mut("config").and_then(Value::as_object_mut) {
         Some(config) => Ok(Some(config)),
@@ -130,12 +128,23 @@ mod live {
                 .speculation
                 .as_ref()
                 .map_or(config.nextn, |spec| spec.num_speculative_tokens());
-            let model = ForwardPassPerfModel::best_available(config).context(
-                "AIS model construction failed; is the venv from \
-                 hpn_calibration/run_hpn.sh on PYTHONPATH?",
-            )?;
+            let model = ForwardPassPerfModel::best_available(config).map_err(|err| {
+                anyhow::anyhow!(
+                    "AIS model construction failed: {err:#}\n(an import error usually \
+                     means the run did not go through hpn_calibration/run_hpn.sh)"
+                )
+            })?;
             if model.diagnostics().readiness != ForwardPassPerfReadiness::Ready {
                 bail!("AIS estimator is not ready; offline replay needs a ready model");
+            }
+            // Same guard as the bindings: speculative decode has no FPM
+            // interpolation support yet.
+            if nextn > 0
+                && model.provenance().is_some_and(|p| {
+                    p.selected_estimation_mode == aisimulate_core::EstimationMode::FpmInterpolation
+                })
+            {
+                bail!("AIS FPM interpolation does not support speculative decode; use op_level");
             }
             Ok(Self { model, nextn })
         }
@@ -281,6 +290,14 @@ mod tests {
         let mut empty = Map::new();
         inject_worker_type(&mut empty, WorkerType::Prefill).unwrap();
         assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn legacy_aic_provider_is_rejected() {
+        let mut engine = ais_engine(qwen_config());
+        engine["timing_model"]["provider"] = json!("aic");
+        let err = inject_worker_type(&mut engine, WorkerType::Prefill).unwrap_err();
+        assert!(err.to_string().contains("\"ais\""), "{err}");
     }
 
     #[test]

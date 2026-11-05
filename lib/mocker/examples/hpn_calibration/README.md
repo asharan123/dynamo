@@ -34,13 +34,14 @@ environment built from AISimulate's own `uv.lock`.
 lib/mocker/examples/hpn_calibration/run_hpn.sh lib/mocker/examples/hpn_calibration/template.json
 ```
 
-The first run builds `<root>/venv` with `uv sync --frozen` against
+The first run builds `<root>/.hpn-venv` with `uv sync --frozen` against
 `aisimulate/python/aisimulate/uv.lock`. On an M-series Mac this took about 5
-minutes, including the Rust build. Later runs reuse the venv. `run_hpn.sh`
-rebuilds the venv when the aisimulate commit changes or the checkout has
-uncommitted changes. uv cannot detect Rust-only edits to the editable package,
-so the script tracks the commit itself. Set `HPN_VENV` to put the venv
-somewhere else.
+minutes, including the Rust build. Later runs reuse the venv. `run_hpn.sh` records the
+aisimulate commit in `<venv>.source` and rebuilds when it changes, or on every
+run while the aisimulate checkout has uncommitted changes, because uv cannot
+detect Rust-only edits to the editable package. Set `HPN_VENV` to put the venv
+somewhere else. The script refuses to sync into an existing directory it did
+not create.
 
 The template replays one 16K-token request. The run writes `run/summary.json`,
 `run/requests.jsonl` and `run/timing.json`, which records each role's resolved
@@ -53,7 +54,7 @@ workload, copy the template and change `trace`, `out_dir` and the worker counts.
 Run this to confirm the venv's perf model matches the handoff numbers:
 
 ```bash
-<root>/venv/bin/python -c '
+<root>/.hpn-venv/bin/python -c '
 from aisimulate_core.sdk import ForwardPassPerfModelConfig as C, RustForwardPassPerfModel as M
 m = M.best_available(C(model="Qwen/Qwen3-32B", system="a100_sxm", backend="vllm",
     backend_version="current", worker_type="prefill", tp=4,
