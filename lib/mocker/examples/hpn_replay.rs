@@ -9,6 +9,11 @@
 //! Relative paths in the experiment file resolve against its directory. The
 //! run writes `requests.jsonl` and `summary.json` to `out_dir`. Both hold only
 //! virtual-time values, so identical inputs must produce identical files.
+//!
+//! A role whose engine `timing_model` uses provider `"ais"` is timed live by the
+//! AISimulate perf model (feature `ais-live`), and the run also writes
+//! `timing.json` with each such role's resolved model identity. Use
+//! `examples/hpn_calibration/run_hpn.sh` for that path.
 
 use std::fs;
 use std::io::{BufWriter, Write};
@@ -25,6 +30,9 @@ use dynamo_mocker::replay::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
+
+#[path = "hpn_replay/ais_timing.rs"]
+mod ais_timing;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -46,7 +54,13 @@ struct Experiment {
     router: Option<Value>,
 }
 
-fn role_config(experiment: &Experiment, worker_type: WorkerType) -> Result<MockerConfig> {
+/// Builds one role's engine config. When the role uses live AIS timing, also
+/// returns the resolved perf-model identity for `timing.json`.
+fn role_config(
+    experiment: &Experiment,
+    worker_type: WorkerType,
+    base: &Path,
+) -> Result<(MockerConfig, Option<Value>)> {
     let mut engine = experiment.engine.clone();
     engine.extend(match worker_type {
         WorkerType::Prefill => experiment.prefill_engine.clone(),
@@ -57,7 +71,11 @@ fn role_config(experiment: &Experiment, worker_type: WorkerType) -> Result<Mocke
         serde_json::to_value(worker_type)?,
     );
     engine.insert("block_size".to_string(), json!(experiment.block_size));
-    MockerConfig::from_value(json!({ "engine": engine }))
+    ais_timing::inject_worker_type(&mut engine, worker_type)?;
+    ais_timing::resolve_systems_paths(&mut engine, base)?;
+    let mut args = MockerConfig::from_value(json!({ "engine": engine }))?;
+    let identity = ais_timing::install(&mut args)?;
+    Ok((args, identity))
 }
 
 fn percentile(sorted: &[f64], quantile: f64) -> Option<f64> {
@@ -86,7 +104,11 @@ fn handoff_ms(record: &PerRequestRecord) -> Option<f64> {
     Some(record.destination_activated_ms? - record.source_held_ms?)
 }
 
-fn write_outputs(out_dir: &Path, report: &TraceSimulationReport) -> Result<()> {
+fn write_outputs(
+    out_dir: &Path,
+    report: &TraceSimulationReport,
+    timing: Option<&Value>,
+) -> Result<()> {
     fs::create_dir_all(out_dir)
         .with_context(|| format!("failed to create {}", out_dir.display()))?;
     let mut records: Vec<&PerRequestRecord> = report.per_request.iter().collect();
@@ -114,6 +136,12 @@ fn write_outputs(out_dir: &Path, report: &TraceSimulationReport) -> Result<()> {
         out_dir.join("summary.json"),
         serde_json::to_string_pretty(&summary)? + "\n",
     )?;
+    if let Some(timing) = timing {
+        fs::write(
+            out_dir.join("timing.json"),
+            serde_json::to_string_pretty(timing)? + "\n",
+        )?;
+    }
     Ok(())
 }
 
@@ -130,9 +158,13 @@ fn main() -> Result<()> {
     )
     .context("invalid experiment file")?;
 
+    let (prefill_args, prefill_timing) = role_config(&experiment, WorkerType::Prefill, base)?;
+    let (decode_args, decode_timing) = role_config(&experiment, WorkerType::Decode, base)?;
+    let timing = (prefill_timing.is_some() || decode_timing.is_some())
+        .then(|| json!({ "prefill": prefill_timing, "decode": decode_timing }));
     let config = OfflineDisaggReplayConfig {
-        prefill_args: role_config(&experiment, WorkerType::Prefill)?,
-        decode_args: role_config(&experiment, WorkerType::Decode)?,
+        prefill_args,
+        decode_args,
         num_prefill_workers: experiment.num_prefill_workers,
         num_decode_workers: experiment.num_decode_workers,
     };
@@ -159,5 +191,5 @@ fn main() -> Result<()> {
         None,
         SlaThresholds::default(),
     )?;
-    write_outputs(&base.join(&experiment.out_dir), &report)
+    write_outputs(&base.join(&experiment.out_dir), &report, timing.as_ref())
 }
