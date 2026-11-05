@@ -426,6 +426,9 @@ pub struct TransferLoad {
     pub sending: usize,
     /// Transfers receiving through each candidate worker's NIC.
     pub receiving: FxHashMap<WorkerWithDpRank, usize>,
+    /// Blocks of this request the router's index places on each candidate. A
+    /// candidate without an entry holds none, so the transfer is the full prompt.
+    pub cached_blocks: FxHashMap<WorkerWithDpRank, usize>,
 }
 
 impl TransferLoad {
@@ -434,6 +437,13 @@ impl TransferLoad {
     pub fn congestion(&self, worker: WorkerWithDpRank) -> usize {
         self.sending
             .max(self.receiving.get(&worker).copied().unwrap_or(0))
+    }
+
+    /// Blocks of a `request_blocks` prompt that must move to `worker`, by the
+    /// router's estimate of what it already holds.
+    pub fn transfer_blocks(&self, worker: WorkerWithDpRank, request_blocks: u64) -> u64 {
+        let cached = self.cached_blocks.get(&worker).copied().unwrap_or(0);
+        request_blocks.saturating_sub(cached as u64)
     }
 }
 
@@ -673,6 +683,19 @@ mod tests {
             worker_loads,
             resp_tx: None,
         }
+    }
+
+    #[test]
+    fn transfer_blocks_subtract_the_estimate_and_stop_at_zero() {
+        let worker = WorkerWithDpRank::new(0, 0);
+        let other = WorkerWithDpRank::new(1, 0);
+        let load = TransferLoad {
+            cached_blocks: [(worker, 90)].into_iter().collect(),
+            ..Default::default()
+        };
+        assert_eq!(load.transfer_blocks(worker, 100), 10);
+        assert_eq!(load.transfer_blocks(worker, 80), 0);
+        assert_eq!(load.transfer_blocks(other, 100), 100);
     }
 
     #[test]

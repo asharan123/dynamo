@@ -19,6 +19,7 @@ fn role(
     worker_type: WorkerType,
     workers_per_nic: usize,
     startup_time_s: Option<f64>,
+    timing_mode: &str,
 ) -> MockerConfig {
     let mut config = MockerConfig::from_value(json!({
         "engine": {
@@ -30,7 +31,7 @@ fn role(
             "max_num_seqs": 32,
             "kv_transfer_bandwidth": 25.0,
             "kv_transfer_bytes_per_token": 320000,
-            "kv_transfer_timing_mode": "full_prompt",
+            "kv_transfer_timing_mode": timing_mode,
             "kv_transfer_workers_per_nic": workers_per_nic,
         }
     }))
@@ -72,24 +73,48 @@ fn replay_with(
             let blocks = input.div_ceil(BLOCK_SIZE) as u64;
             let hash_ids = (next_hash..next_hash + blocks).collect();
             next_hash += blocks;
-            MooncakeRow {
-                timestamp: Some(arrival_ms),
-                input_length: Some(input),
-                output_length: Some(output),
-                hash_ids: Some(hash_ids),
-                ..Default::default()
-            }
+            row(arrival_ms, input, output, hash_ids)
         })
         .collect();
+    replay_rows(
+        rows,
+        num_decode_workers,
+        decode_workers_per_nic,
+        decode_startup_time_s,
+        router_config,
+        "full_prompt",
+    )
+}
+
+fn row(arrival_ms: f64, input: usize, output: usize, hash_ids: Vec<u64>) -> MooncakeRow {
+    MooncakeRow {
+        timestamp: Some(arrival_ms),
+        input_length: Some(input),
+        output_length: Some(output),
+        hash_ids: Some(hash_ids),
+        ..Default::default()
+    }
+}
+
+fn replay_rows(
+    rows: Vec<MooncakeRow>,
+    num_decode_workers: usize,
+    decode_workers_per_nic: usize,
+    decode_startup_time_s: Option<f64>,
+    router_config: KvRouterConfig,
+    timing_mode: &str,
+) -> Vec<PerRequestRecord> {
+    let num_prefill_workers = rows.len();
     let report = simulate_loaded_trace_disagg_with_router_mode_and_capture_options(
         OfflineDisaggReplayConfig {
-            prefill_args: role(WorkerType::Prefill, 1, None),
+            prefill_args: role(WorkerType::Prefill, 1, None, timing_mode),
             decode_args: role(
                 WorkerType::Decode,
                 decode_workers_per_nic,
                 decode_startup_time_s,
+                timing_mode,
             ),
-            num_prefill_workers: requests.len(),
+            num_prefill_workers,
             num_decode_workers,
         },
         Some(router_config),
@@ -235,6 +260,8 @@ fn decision_log_explains_every_decode_decision() {
                 "decode_blocks",
                 "active_requests",
                 "receiving",
+                "cached_blocks",
+                "transfer_blocks",
                 "network_cost",
                 "total_cost",
             ] {
@@ -277,4 +304,108 @@ fn decision_log_does_not_change_the_replay() {
     ))
     .unwrap();
     assert_eq!(requests, logged);
+}
+
+/// Requests in the order they arrive: `cached` leaves its prompt on one worker,
+/// `resident` then loads the other, `in_flight` is receiving on the first when
+/// `probe` repeats the cached prompt.
+fn cached_busy_nic_rows() -> Vec<MooncakeRow> {
+    let cached_prompt: Vec<u64> = (0..16).collect();
+    let cached_input = cached_prompt.len() * BLOCK_SIZE;
+    vec![
+        row(0.0, cached_input, 256, cached_prompt.clone()),
+        row(200.0, 32_256, 8_000, (100..163).collect()),
+        row(30_000.0, 16_384, 4_000, (200..232).collect()),
+        row(30_400.0, cached_input, 8, cached_prompt),
+    ]
+}
+
+fn cached_busy_nic_replay(
+    timing_mode: &str,
+) -> (Vec<PerRequestRecord>, Vec<Value>, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("decisions.jsonl");
+    let records = replay_rows(
+        cached_busy_nic_rows(),
+        2,
+        1,
+        None,
+        logging_config(&log, 3.0),
+        timing_mode,
+    );
+    let decisions = read_decisions(&log);
+    (records, decisions, dir)
+}
+
+#[test]
+fn cached_worker_pays_nothing_for_its_busy_nic_under_destination_missing() {
+    let (records, decisions, _dir) = cached_busy_nic_replay("destination_missing");
+    let [cached, resident, in_flight, probe] = records.as_slice() else {
+        panic!("expected four records");
+    };
+    assert_ne!(decode_worker(cached), decode_worker(resident));
+    assert_eq!(decode_worker(in_flight), decode_worker(cached));
+    assert!(probe.source_held_ms.unwrap() < in_flight.destination_activated_ms.unwrap());
+    assert_eq!(decode_worker(probe), decode_worker(cached));
+    assert_eq!(probe.destination_missing_tokens, Some(0));
+
+    let decision = decisions
+        .iter()
+        .find(|decision| decision["request_id"] == probe.uuid.as_str())
+        .unwrap();
+    assert_eq!(decision["request_blocks"].as_u64(), Some(16));
+    let candidate = |rank: usize| {
+        decision["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|candidate| candidate["rank"].as_u64() == Some(rank as u64))
+            .unwrap()
+    };
+    let (holder, other) = (
+        candidate(decode_worker(cached)),
+        candidate(decode_worker(resident)),
+    );
+    assert_eq!(holder["receiving"].as_u64(), Some(1));
+    assert_eq!(holder["cached_blocks"].as_u64(), Some(16));
+    assert_eq!(holder["transfer_blocks"].as_u64(), Some(0));
+    assert_eq!(holder["network_cost"].as_f64(), Some(0.0));
+    assert_eq!(other["cached_blocks"].as_u64(), Some(0));
+    assert_eq!(other["transfer_blocks"].as_u64(), Some(16));
+}
+
+#[test]
+fn cached_worker_still_pays_for_the_full_prompt_under_full_prompt() {
+    let (records, decisions, _dir) = cached_busy_nic_replay("full_prompt");
+    let [cached, resident, in_flight, probe] = records.as_slice() else {
+        panic!("expected four records");
+    };
+    assert_ne!(decode_worker(cached), decode_worker(resident));
+    assert_eq!(decode_worker(in_flight), decode_worker(cached));
+    assert!(probe.source_held_ms.unwrap() < in_flight.destination_activated_ms.unwrap());
+    assert_eq!(decode_worker(probe), decode_worker(resident));
+    assert!(
+        decisions
+            .iter()
+            .flat_map(|decision| decision["candidates"].as_array().unwrap())
+            .all(|candidate| candidate["cached_blocks"].as_u64() == Some(0))
+    );
+}
+
+#[test]
+fn estimated_and_actual_transfer_agree_on_a_cold_request() {
+    let (records, decisions, _dir) = cached_busy_nic_replay("destination_missing");
+    let cold = &records[0];
+    assert_eq!(cold.destination_missing_tokens, Some(16 * BLOCK_SIZE));
+    let decision = decisions
+        .iter()
+        .find(|decision| decision["request_id"] == cold.uuid.as_str())
+        .unwrap();
+    assert!(
+        decision["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|candidate| candidate["transfer_blocks"].as_u64() == Some(16))
+    );
 }

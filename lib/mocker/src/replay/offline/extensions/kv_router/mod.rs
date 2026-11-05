@@ -214,6 +214,7 @@ struct TransferDecision {
     source_rank: usize,
     source_nic: usize,
     sending: usize,
+    request_blocks: u64,
     selected_rank: usize,
     candidates: Vec<TransferDecisionCandidate>,
 }
@@ -226,6 +227,8 @@ struct TransferDecisionCandidate {
     decode_blocks: usize,
     active_requests: usize,
     receiving: usize,
+    cached_blocks: usize,
+    transfer_blocks: u64,
     network_cost: f64,
     total_cost: f64,
 }
@@ -1129,7 +1132,13 @@ impl OfflineReplayRouter {
             .slots
             .project_worker_loads(request.token_seq.as_deref(), decay_now);
         let mut scheduling_request = request.scheduling_request(worker_loads);
-        scheduling_request.transfer_load = self.transfer_load_for(request.transfer_source);
+        scheduling_request.transfer_load =
+            self.transfer_load_for(request.transfer_source, &scheduling_request.overlap);
+        if scheduling_request.transfer_load.is_some() {
+            // The estimate only prices the transfer. Decode stays load-only for
+            // everything else, including the overlap this placement reports.
+            scheduling_request.overlap = OverlapSignals::default();
+        }
         let eligibility = scheduling_request.eligibility();
         // Best and selected overlap use the same weighted, rounded blocks as
         // the production router's overlap metric.
@@ -1217,7 +1226,7 @@ impl OfflineReplayRouter {
         ) else {
             return Ok(());
         };
-        let request_blocks = scheduling_request.request_blocks(self.block_size) as f64;
+        let request_blocks = scheduling_request.request_blocks(self.block_size);
         let mut candidates: Vec<_> = load
             .receiving
             .iter()
@@ -1229,8 +1238,9 @@ impl OfflineReplayRouter {
                     .get(worker)
                     .copied()
                     .unwrap_or_default();
+                let transfer_blocks = load.transfer_blocks(*worker, request_blocks);
                 let network_cost = self.config.transfer_load_weight
-                    * request_blocks
+                    * transfer_blocks as f64
                     * load.congestion(*worker) as f64;
                 let decode_blocks = projection.potential_decode_blocks();
                 TransferDecisionCandidate {
@@ -1239,6 +1249,8 @@ impl OfflineReplayRouter {
                     decode_blocks,
                     active_requests: projection.active_requests,
                     receiving: *receiving,
+                    cached_blocks: load.cached_blocks.get(worker).copied().unwrap_or(0),
+                    transfer_blocks,
                     network_cost,
                     total_cost: decode_blocks as f64
                         + self.config.decode_active_request_weight
@@ -1254,6 +1266,7 @@ impl OfflineReplayRouter {
             source_rank,
             source_nic: view.send_nic(source_rank),
             sending: load.sending,
+            request_blocks,
             selected_rank,
             candidates,
         };
@@ -1271,7 +1284,11 @@ impl OfflineReplayRouter {
 
     /// Read NIC load at selection time, so a queued request sees the load at
     /// its release rather than at its arrival.
-    fn transfer_load_for(&self, source: Option<usize>) -> Option<TransferLoad> {
+    fn transfer_load_for(
+        &self,
+        source: Option<usize>,
+        overlap: &OverlapSignals,
+    ) -> Option<TransferLoad> {
         let (load, source) = (self.transfer_load.as_ref()?, source?);
         let dp_size = self.dp_size as usize;
         let mut receiving = FxHashMap::default();
@@ -1287,6 +1304,7 @@ impl OfflineReplayRouter {
         Some(TransferLoad {
             sending: load.sending(source),
             receiving,
+            cached_blocks: overlap.tier_overlap_blocks.device.clone(),
         })
     }
 

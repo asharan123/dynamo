@@ -490,6 +490,15 @@ fn transfer_scoring_selection(
     blocks: [usize; 2],
     transfer_load: Option<(usize, [usize; 2])>,
 ) -> u64 {
+    cached_transfer_scoring_selection(weight, blocks, transfer_load, [0, 0])
+}
+
+fn cached_transfer_scoring_selection(
+    weight: f64,
+    blocks: [usize; 2],
+    transfer_load: Option<(usize, [usize; 2])>,
+    cached_blocks: [usize; 2],
+) -> u64 {
     let (workers, mut request) = fixture(2, 1600);
     request.overlap = Default::default();
     request.track_prefill_tokens = false;
@@ -507,6 +516,9 @@ fn transfer_scoring_selection(
         sending,
         receiving: (0..2u64)
             .map(|id| (WorkerWithDpRank::new(id, 0), receiving[id as usize]))
+            .collect(),
+        cached_blocks: (0..2u64)
+            .map(|id| (WorkerWithDpRank::new(id, 0), cached_blocks[id as usize]))
             .collect(),
     });
     let policy = default_policy(
@@ -579,6 +591,57 @@ fn idle_network_and_shared_nic_leave_block_load_to_decide() {
     // Two candidates on one NIC see one receive load.
     assert_eq!(
         transfer_scoring_selection(1.0, [6, 5], Some((0, [3, 3]))),
+        1
+    );
+}
+
+#[test]
+fn transfer_cost_counts_only_blocks_missing_at_the_candidate() {
+    // Worker 0 holds 90 of 100 blocks, so it pays 1 * 10 * 3 = 30.
+    assert_eq!(
+        cached_transfer_scoring_selection(1.0, [0, 29], Some((0, [3, 0])), [90, 0]),
+        1
+    );
+    assert_eq!(
+        cached_transfer_scoring_selection(1.0, [0, 31], Some((0, [3, 0])), [90, 0]),
+        0
+    );
+}
+
+#[test]
+fn full_hit_pays_no_transfer_cost() {
+    assert_eq!(
+        cached_transfer_scoring_selection(1.0, [50, 49], Some((0, [50, 0])), [100, 0]),
+        1
+    );
+    assert_eq!(
+        cached_transfer_scoring_selection(1.0, [49, 50], Some((0, [50, 0])), [100, 0]),
+        0
+    );
+    // An estimate past the prompt still costs nothing rather than a credit.
+    assert_eq!(
+        cached_transfer_scoring_selection(1.0, [50, 49], Some((0, [50, 0])), [200, 0]),
+        1
+    );
+}
+
+#[test]
+fn busy_send_nic_charges_candidates_by_their_missing_blocks() {
+    // At sending 4, worker 0 pays 40 and worker 1 pays 400, a margin of 360.
+    assert_eq!(
+        cached_transfer_scoring_selection(1.0, [359, 0], Some((4, [0, 0])), [90, 0]),
+        0
+    );
+    assert_eq!(
+        cached_transfer_scoring_selection(1.0, [361, 0], Some((4, [0, 0])), [90, 0]),
+        1
+    );
+}
+
+#[test]
+fn idle_network_ignores_cached_blocks() {
+    assert_eq!(
+        cached_transfer_scoring_selection(1.0, [6, 5], Some((0, [0, 0])), [100, 0]),
         1
     );
 }

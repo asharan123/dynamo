@@ -227,8 +227,10 @@ impl<const REQUEST_COST: bool, const SHARED_CREDIT: bool>
         };
         // Skipped at weight zero so the score keeps its exact unweighted value.
         let logit = if self.transfer_load_weight != 0.0 {
-            let congestion = context.transfer_congestion(candidate.worker()).unwrap_or(0);
-            logit + self.transfer_load_weight * context.request_blocks() as f64 * congestion as f64
+            let worker = candidate.worker();
+            let congestion = context.transfer_congestion(worker).unwrap_or(0);
+            let blocks = context.transfer_blocks(worker).unwrap_or(0);
+            logit + self.transfer_load_weight * blocks as f64 * congestion as f64
         } else {
             logit
         };

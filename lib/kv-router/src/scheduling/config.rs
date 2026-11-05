@@ -815,8 +815,9 @@ pub struct KvRouterConfig {
     pub decode_active_request_weight: f64,
 
     /// Weight of KV transfer contention in worker cost, charged as this weight
-    /// times the request's blocks times the other transfers on the busier NIC of
-    /// the path. It applies only when the host models NICs. Defaults to 0.0.
+    /// times the blocks the candidate is estimated to lack times the other
+    /// transfers on the busier NIC of the path. It applies only when the host
+    /// models NICs. Defaults to 0.0.
     #[serde(default, skip_serializing_if = "is_default")]
     pub transfer_load_weight: f64,
 

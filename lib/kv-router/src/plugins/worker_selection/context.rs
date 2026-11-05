@@ -47,6 +47,15 @@ impl WorkerSelectionContext<'_> {
             .map(|load| load.congestion(worker))
     }
 
+    /// Blocks of this request that must move to `worker`, or `None` when the host
+    /// does not model NICs for this selection.
+    pub fn transfer_blocks(&self, worker: WorkerWithDpRank) -> Option<u64> {
+        self.request
+            .transfer_load
+            .as_ref()
+            .map(|load| load.transfer_blocks(worker, self.request_blocks))
+    }
+
     /// Return the number of tokens in one KV block.
     pub fn block_size(&self) -> u32 {
         self.block_size
