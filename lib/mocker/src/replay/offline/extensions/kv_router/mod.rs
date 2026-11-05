@@ -1725,7 +1725,7 @@ mod tests {
     fn load_only_placement_drops_kv_events() {
         let cached_blocks = |drop| {
             let mut placement =
-                KvRouterPlacement::new_with_selector_seed(&replay_args(), None, None, 1, Some(1))
+                KvRouterPlacement::new_with_selector_seed(&replay_args(), None, None, 1, None)
                     .expect("placement construction")
                     .with_dropped_kv_events(drop);
             let event = prompt_store_event(0, 1, &[LocalBlockHash(1)], StorageTier::Device);
