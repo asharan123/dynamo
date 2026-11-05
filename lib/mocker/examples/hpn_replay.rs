@@ -19,6 +19,7 @@ use std::fs;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
+use aisimulate_core::replay::{PerRequestAdmissionRecord, ReplayRequestPool};
 use anyhow::{Context, Result, bail};
 use dynamo_kv_router::config::KvRouterConfig;
 use dynamo_mocker::common::protocols::{MockerConfig, WorkerType};
@@ -104,6 +105,25 @@ fn handoff_ms(record: &PerRequestRecord) -> Option<f64> {
     Some(record.destination_activated_ms? - record.source_held_ms?)
 }
 
+/// Readmission totals per pool. A readmission is a preempt-and-readmit; the
+/// replay report has no direct preemption counter.
+fn readmissions<'a>(histories: impl Iterator<Item = &'a [PerRequestAdmissionRecord]>) -> Value {
+    let (mut prefill, mut decode, mut requests) = (0usize, 0usize, 0usize);
+    for history in histories {
+        let mut readmitted = false;
+        for admission in history.iter().filter(|a| a.is_readmission) {
+            readmitted = true;
+            match admission.pool {
+                ReplayRequestPool::Prefill => prefill += 1,
+                ReplayRequestPool::Decode => decode += 1,
+                ReplayRequestPool::Agg => {}
+            }
+        }
+        requests += usize::from(readmitted);
+    }
+    json!({ "prefill": prefill, "decode": decode, "requests_readmitted": requests })
+}
+
 fn write_outputs(
     out_dir: &Path,
     report: &TraceSimulationReport,
@@ -131,6 +151,7 @@ fn write_outputs(
         "itl_ms": stats(records.iter().filter_map(|r| r.itl_ms).collect()),
         "e2e_ms": stats(records.iter().filter_map(|r| r.e2e_latency_ms).collect()),
         "handoff_ms": stats(records.iter().filter_map(|r| handoff_ms(r)).collect()),
+        "readmissions": readmissions(records.iter().map(|r| r.admission_history.as_slice())),
     });
     fs::write(
         out_dir.join("summary.json"),
@@ -192,4 +213,48 @@ fn main() -> Result<()> {
         SlaThresholds::default(),
     )?;
     write_outputs(&base.join(&experiment.out_dir), &report, timing.as_ref())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn admission(pool: ReplayRequestPool, is_readmission: bool) -> PerRequestAdmissionRecord {
+        PerRequestAdmissionRecord {
+            admission_ordinal: 0,
+            pool_admission_ordinal: 0,
+            pool,
+            at_ms: 0.0,
+            reused_input_tokens: 0,
+            g1_reused_input_tokens: None,
+            host_reused_input_tokens: None,
+            is_readmission,
+        }
+    }
+
+    #[test]
+    fn readmissions_count_per_pool_and_per_request() {
+        use ReplayRequestPool::{Decode, Prefill};
+        let clean = vec![admission(Prefill, false), admission(Decode, false)];
+        let preempted = vec![
+            admission(Prefill, false),
+            admission(Decode, false),
+            admission(Decode, true),
+            admission(Decode, true),
+        ];
+        let prefill_retry = vec![admission(Prefill, false), admission(Prefill, true)];
+        let histories = [clean, preempted, prefill_retry];
+        assert_eq!(
+            readmissions(histories.iter().map(Vec::as_slice)),
+            json!({"prefill": 1, "decode": 2, "requests_readmitted": 2})
+        );
+    }
+
+    #[test]
+    fn no_readmissions_reports_zeros() {
+        assert_eq!(
+            readmissions(std::iter::empty()),
+            json!({"prefill": 0, "decode": 0, "requests_readmitted": 0})
+        );
+    }
 }
