@@ -12,7 +12,7 @@ use dynamo_kv_router::config::{KvRouterConfig, RouterPrefillLoadModel};
 use std::collections::HashSet;
 
 use super::{KvReplayMetadata, KvRouterPlacement};
-use crate::common::protocols::MockerConfig;
+use crate::common::protocols::{KvTransferTimingMode, MockerConfig};
 use crate::replay::ReplayPrefillLoadEstimator;
 use crate::replay::offline::extensions::kv_events::RouterEventObservation;
 
@@ -230,15 +230,18 @@ impl ReplayComposition for KvReplayComposition {
         )
         .context("constructing prefill KV Router placement")?
         .with_kv_event_lag_ms(self.kv_event_lag_ms)?;
+        let decode_config = derive_decode_router_config(decode_args, router_config);
+        let drops_kv_events = !decode_needs_kv_events(decode_args, &decode_config);
         let decode = KvRouterPlacement::new_with_selector_seed(
             decode_args,
-            Some(derive_decode_router_config(decode_args, router_config)),
+            Some(decode_config),
             None,
             decode_topology.len(),
             self.determinism.selector_seed(),
         )
         .context("constructing decode KV Router placement")?
-        .with_kv_event_lag_ms(self.kv_event_lag_ms)?;
+        .with_kv_event_lag_ms(self.kv_event_lag_ms)?
+        .with_dropped_kv_events(drops_kv_events);
         Ok((prefill, decode))
     }
 
@@ -372,6 +375,14 @@ pub(in crate::replay) fn derive_decode_router_config(
     config.router_track_prefill_tokens = false;
     config.router_prefill_load_model = RouterPrefillLoadModel::None;
     config
+}
+
+/// Decode placement stays load-only unless the network term prices the blocks a
+/// destination is missing, which takes the router's view of decode caches.
+fn decode_needs_kv_events(args: &MockerConfig, config: &KvRouterConfig) -> bool {
+    config.transfer_load_weight > 0.0
+        && args.kv_transfer_workers_per_nic.is_some()
+        && args.kv_transfer_timing_mode == KvTransferTimingMode::DestinationMissing
 }
 
 #[cfg(test)]
@@ -590,6 +601,37 @@ mod tests {
             .unwrap();
         assert_eq!(prefill.router.kv_event_lag_ms, 25.0);
         assert_eq!(decode.router.kv_event_lag_ms, 25.0);
+    }
+
+    #[test]
+    fn decode_needs_kv_events_only_to_price_missing_blocks_on_a_modeled_nic() {
+        let args = |mode: KvTransferTimingMode, workers_per_nic: Option<usize>| {
+            MockerConfig::from_value(serde_json::json!({
+                "engine": {
+                    "kv_transfer_timing_mode": mode,
+                    "kv_transfer_workers_per_nic": workers_per_nic,
+                }
+            }))
+            .unwrap()
+        };
+        let config = |weight| KvRouterConfig {
+            transfer_load_weight: weight,
+            ..Default::default()
+        };
+        let missing = KvTransferTimingMode::DestinationMissing;
+        assert!(decode_needs_kv_events(
+            &args(missing, Some(1)),
+            &config(1.0)
+        ));
+        assert!(!decode_needs_kv_events(
+            &args(missing, Some(1)),
+            &config(0.0)
+        ));
+        assert!(!decode_needs_kv_events(&args(missing, None), &config(1.0)));
+        assert!(!decode_needs_kv_events(
+            &args(KvTransferTimingMode::FullPrompt, Some(1)),
+            &config(1.0)
+        ));
     }
 
     #[cfg(feature = "replay-bench")]

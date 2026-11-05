@@ -271,8 +271,8 @@ struct SyncReplayIndexer {
     /// Non-device (for example cluster-shared G2 `HostPinned`) residency,
     /// allocated on the first lower-tier event so G1-only replays pay nothing.
     lower_tier: Option<LowerTierIndexers>,
-    /// Disaggregated decode placement never observes KV events, so its tree
-    /// stays empty and hashing a prompt to query it would be wasted work.
+    /// Load-only decode placement drops KV events, so its tree stays empty and
+    /// hashing a prompt to query it would be wasted work.
     has_indexed_events: bool,
 }
 
@@ -457,6 +457,8 @@ pub(crate) struct OfflineReplayRouter {
     prefill_load_estimator: Option<ReplayPrefillLoadEstimator>,
     /// Live NIC load, bound on the decode router when the replay models NICs.
     transfer_load: Option<TransferLoadView>,
+    /// Keeps a load-only decode router's index empty, as in plain Dynamo decode.
+    drops_kv_events: bool,
     /// Opened at the first decision, so only the NIC-aware decode router writes.
     transfer_decision_log: Option<LineWriter<File>>,
     decay_time_epoch: Instant,
@@ -498,6 +500,11 @@ impl KvRouterPlacement {
     pub(in crate::replay) fn with_kv_event_lag_ms(mut self, lag_ms: f64) -> Result<Self> {
         self.router.set_kv_event_lag_ms(lag_ms)?;
         Ok(self)
+    }
+
+    pub(in crate::replay) fn with_dropped_kv_events(mut self, drop: bool) -> Self {
+        self.router.drops_kv_events = drop;
+        self
     }
 
     fn placement(&self, admission: WorkerAdmission) -> Placement {
@@ -617,7 +624,12 @@ impl<Request: PlacementRequestView> PlacementPolicy<Request> for KvRouterPlaceme
     }
 
     fn observe(&mut self, observation: RouterEventBatch, now_ms: f64) -> Result<Vec<Placement>> {
-        let effects = self.router.on_kv_events_at(observation.0, now_ms)?;
+        let events = if self.router.drops_kv_events {
+            Vec::new()
+        } else {
+            observation.0
+        };
+        let effects = self.router.on_kv_events_at(events, now_ms)?;
         Ok(self.placements(effects.admissions))
     }
 
@@ -710,6 +722,7 @@ impl OfflineReplayRouter {
             indexer: SyncReplayIndexer::new(args.block_size as u32),
             prefill_load_estimator,
             transfer_load: None,
+            drops_kv_events: false,
             transfer_decision_log: None,
             // This is only a base Instant for converting replay `now_ms` values into
             // synthetic `Instant`s. All subsequent decay/accounting uses virtual replay
@@ -1399,7 +1412,10 @@ mod tests {
     use tempfile::NamedTempFile;
     use uuid::Uuid;
 
-    use super::{OfflineReplayRouter, ReplayRequestHashes, SyncReplayIndexer, WorkerAdmission};
+    use super::{
+        KvRouterPlacement, OfflineReplayRouter, PlacementPolicy, ReplayRequestHashes,
+        RouterEventBatch, SyncReplayIndexer, WorkerAdmission,
+    };
     use crate::common::protocols::{DirectRequest, MockerConfig};
     use crate::replay::ReplayPrefillLoadEstimator;
     use aisimulate_core::replay::{ReplayPromptTokenSource, ReplayRequestContext};
@@ -1685,6 +1701,30 @@ mod tests {
             },
             storage_tier,
         )
+    }
+
+    #[test]
+    fn load_only_placement_drops_kv_events() {
+        let cached_blocks = |drop| {
+            let mut placement =
+                KvRouterPlacement::new_with_selector_seed(&replay_args(), None, None, 1, Some(1))
+                    .expect("placement construction")
+                    .with_dropped_kv_events(drop);
+            let event = prompt_store_event(0, 1, &[LocalBlockHash(1)], StorageTier::Device);
+            PlacementPolicy::<DirectRequest>::observe(
+                &mut placement,
+                RouterEventBatch(vec![event]),
+                0.0,
+            )
+            .unwrap();
+            placement
+                .router
+                .debug_snapshot(0.0)
+                .indexer
+                .total_cached_blocks
+        };
+        assert_eq!(cached_blocks(true), 0);
+        assert_eq!(cached_blocks(false), 1);
     }
 
     #[test]
