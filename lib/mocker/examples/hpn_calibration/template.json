@@ -1,0 +1,41 @@
+{
+  "trace": "single_16k.jsonl",
+  "out_dir": "run",
+  "block_size": 512,
+  "num_prefill_workers": 8,
+  "num_decode_workers": 4,
+  "engine": {
+    "backend": "vllm",
+    "kv_transfer_bandwidth": 25.0,
+    "kv_transfer_bytes_per_token": 262144,
+    "kv_transfer_timing_mode": "destination_missing",
+    "kv_transfer_workers_per_nic": 1,
+    "timing_model": {
+      "type": "external",
+      "provider": "ais",
+      "config": {
+        "model": "Qwen/Qwen3-32B",
+        "system": "a100_sxm",
+        "backend": "vllm",
+        "backend_version": "current",
+        "tp": 4,
+        "estimation_mode": "op_level",
+        "fallback_policy": "deny",
+        "systems_paths": ["../../../../../aisimulate/python/aisimulate/src/aisimulate_core/systems"]
+      }
+    }
+  },
+  "prefill_engine": {
+    "num_gpu_blocks": 439,
+    "max_num_seqs": 256,
+    "max_num_batched_tokens": 40960
+  },
+  "decode_engine": {
+    "num_gpu_blocks": 534,
+    "max_num_seqs": 256,
+    "max_num_batched_tokens": 2048
+  },
+  "router": {
+    "transfer_load_weight": 0.0
+  }
+}
