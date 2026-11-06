@@ -1,5 +1,7 @@
 # A100 40GB nominal hardware rerun (6 November 2026)
 
+**Historical run:** These results use AISimulate `33bc0318`. The decode-preemption timing fix in `edcbc713` changes some high-cache results. Use the [updated rerun](edcbc713-rerun/REPORT.md) for current conclusions; this report and its original result files remain as before-and-after evidence.
+
 ## Scope and provenance
 
 This is a **simulation sensitivity study**, not a measurement on NSCC ASPIRE 2A. It reruns the network-aware decode routing follow-up experiments with the handoff's target layout: 8 prefill nodes and 4 decode nodes, one TP=4 worker per four-GPU node, Qwen3-32B, 16,384-token prompts, 262,144 KV bytes per token, and 439 prefill / 534 decode GPU blocks. The model has 256 maximum sequences per worker and maximum batched tokens of 40,960 (prefill) / 2,048 (decode). A run has 1,000 Poisson-arrival requests. Each policy comparison uses the same trace seed.
