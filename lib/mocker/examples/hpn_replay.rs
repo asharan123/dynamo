@@ -119,15 +119,20 @@ fn transfer_ms(record: &PerRequestRecord) -> Option<f64> {
 /// Token-weighted achieved hit rates. `prefill` is the share of prompt tokens
 /// the prefill worker reused from its cache. `decode_destination` is the share
 /// the decode destination already held, so it did not have to receive them.
+/// Destinations count missing tokens in whole blocks, so a prompt counts as its
+/// block-rounded length there.
 /// Each row is `(input_length, reused_input_tokens, destination_missing_tokens)`.
-fn hit_rates(rows: impl Iterator<Item = (usize, usize, Option<usize>)>) -> Value {
+fn hit_rates(
+    rows: impl Iterator<Item = (usize, usize, Option<usize>)>,
+    block_size: usize,
+) -> Value {
     let (mut input, mut reused) = (0usize, 0usize);
     let (mut handed_off, mut missing) = (0usize, 0usize);
     for (input_length, reused_tokens, missing_tokens) in rows {
         input += input_length;
         reused += reused_tokens;
         if let Some(missing_tokens) = missing_tokens {
-            handed_off += input_length;
+            handed_off += input_length.div_ceil(block_size) * block_size;
             missing += missing_tokens;
         }
     }
@@ -161,6 +166,7 @@ fn write_outputs(
     out_dir: &Path,
     report: &TraceSimulationReport,
     timing: Option<&Value>,
+    block_size: usize,
 ) -> Result<()> {
     fs::create_dir_all(out_dir)
         .with_context(|| format!("failed to create {}", out_dir.display()))?;
@@ -186,9 +192,12 @@ fn write_outputs(
         "handoff_ms": stats(records.iter().filter_map(|r| handoff_ms(r)).collect()),
         "reserve_wait_ms": stats(records.iter().filter_map(|r| reserve_wait_ms(r)).collect()),
         "transfer_ms": stats(records.iter().filter_map(|r| transfer_ms(r)).collect()),
-        "hit_rate": hit_rates(records.iter().map(|r| {
-            (r.input_length, r.reused_input_tokens, r.destination_missing_tokens)
-        })),
+        "hit_rate": hit_rates(
+            records.iter().map(|r| {
+                (r.input_length, r.reused_input_tokens, r.destination_missing_tokens)
+            }),
+            block_size,
+        ),
         "readmissions": readmissions(records.iter().map(|r| r.admission_history.as_slice())),
     });
     fs::write(
@@ -255,7 +264,12 @@ fn main() -> Result<()> {
         None,
         SlaThresholds::default(),
     )?;
-    write_outputs(&base.join(&experiment.out_dir), &report, timing.as_ref())
+    write_outputs(
+        &base.join(&experiment.out_dir),
+        &report,
+        timing.as_ref(),
+        experiment.block_size,
+    )
 }
 
 #[cfg(test)]
@@ -303,21 +317,31 @@ mod tests {
 
     #[test]
     fn hit_rates_are_token_weighted() {
+        // At block size 512 the handed-off prompts span 1024 and 3072 tokens.
         let rows = [
-            (1000, 500, Some(1000)),
+            (1000, 500, Some(1024)),
             (3000, 3000, Some(0)),
             (1000, 0, None),
         ];
         assert_eq!(
-            hit_rates(rows.into_iter()),
+            hit_rates(rows.into_iter(), 512),
             json!({"prefill": 0.7, "decode_destination": 0.75})
+        );
+    }
+
+    #[test]
+    fn cold_destination_has_zero_hit_rate_for_a_partial_last_block() {
+        let rows = [(1000, 0, Some(1024))];
+        assert_eq!(
+            hit_rates(rows.into_iter(), 512)["decode_destination"],
+            json!(0.0)
         );
     }
 
     #[test]
     fn hit_rates_without_tokens_are_null() {
         assert_eq!(
-            hit_rates(std::iter::empty()),
+            hit_rates(std::iter::empty(), 512),
             json!({"prefill": null, "decode_destination": null})
         );
     }
