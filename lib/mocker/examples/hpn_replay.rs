@@ -9,15 +9,20 @@
 //! Relative paths in the experiment file resolve against its directory. The
 //! run writes `requests.jsonl` and `summary.json` to `out_dir`. Both hold only
 //! virtual-time values, so identical inputs must produce identical files.
+//!
+//! A role whose engine `timing_model` uses provider `"ais"` is timed live by the
+//! AISimulate perf model (feature `ais-live`), and the run also writes
+//! `timing.json` with each such role's resolved model identity and the source
+//! commits `run_hpn.sh` exports. Use
+//! `examples/hpn_calibration/run_hpn.sh` for that path.
 
 use std::fs;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
-use anyhow::{Context, Result, bail, ensure};
+use aisimulate_core::replay::{PerRequestAdmissionRecord, ReplayRequestPool};
+use anyhow::{Context, Result, bail};
 use dynamo_kv_router::config::KvRouterConfig;
-use dynamo_mocker::common::perf_model::{AisCallback, PerfModel};
 use dynamo_mocker::common::protocols::{MockerConfig, WorkerType};
 use dynamo_mocker::loadgen::Trace;
 use dynamo_mocker::replay::{
@@ -27,6 +32,9 @@ use dynamo_mocker::replay::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
+
+#[path = "hpn_replay/ais_timing.rs"]
+mod ais_timing;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -46,118 +54,15 @@ struct Experiment {
     /// Partial `KvRouterConfig`; omitted fields keep their defaults.
     #[serde(default)]
     router: Option<Value>,
-    /// Experiment-only table with prefill axes (batch, new, cached) and decode
-    /// axes (batch, context). Generated from the canonical FPM API.
-    #[serde(default)]
-    timing_table: Option<PathBuf>,
 }
 
-#[derive(Clone, Deserialize)]
-struct TimingTable {
-    model: String,
-    system: String,
-    backend: String,
-    backend_version: String,
-    tp: usize,
-    prefill_batch: Vec<usize>,
-    prefill_new: Vec<usize>,
-    prefill_cached: Vec<usize>,
-    prefill_ms: Vec<Vec<Vec<f64>>>,
-    decode_batch: Vec<usize>,
-    decode_context: Vec<usize>,
-    decode_ms: Vec<Vec<f64>>,
-}
-
-impl TimingTable {
-    fn validate(&self) -> Result<()> {
-        fn axis(name: &str, values: &[usize]) -> Result<()> {
-            ensure!(
-                values.len() >= 2 && values.windows(2).all(|pair| pair[0] < pair[1]),
-                "{name} must contain at least two strictly increasing points"
-            );
-            Ok(())
-        }
-        for (name, values) in [
-            ("prefill_batch", &self.prefill_batch),
-            ("prefill_new", &self.prefill_new),
-            ("prefill_cached", &self.prefill_cached),
-            ("decode_batch", &self.decode_batch),
-            ("decode_context", &self.decode_context),
-        ] {
-            axis(name, values)?;
-        }
-        ensure!(self.tp > 0, "timing table tp must be positive");
-        ensure!(
-            self.prefill_ms.len() == self.prefill_batch.len()
-                && self.prefill_ms.iter().all(|layer| {
-                    layer.len() == self.prefill_new.len()
-                        && layer.iter().all(|row| {
-                            row.len() == self.prefill_cached.len()
-                                && row.iter().all(|ms| ms.is_finite() && *ms >= 0.0)
-                        })
-                }),
-            "prefill timing table has invalid shape or latency"
-        );
-        ensure!(
-            self.decode_ms.len() == self.decode_batch.len()
-                && self.decode_ms.iter().all(|row| {
-                    row.len() == self.decode_context.len()
-                        && row.iter().all(|ms| ms.is_finite() && *ms >= 0.0)
-                }),
-            "decode timing table has invalid shape or latency"
-        );
-        Ok(())
-    }
-}
-
-fn bracket(axis: &[usize], value: usize) -> Result<(usize, usize, f64)> {
-    if axis.len() < 2 || value < axis[0] || value > *axis.last().unwrap() {
-        bail!("timing query {value} is outside table axis {axis:?}");
-    }
-    match axis.binary_search(&value) {
-        Ok(index) => Ok((index, index, 0.0)),
-        Err(upper) => {
-            let lower = upper - 1;
-            let fraction = (value - axis[lower]) as f64 / (axis[upper] - axis[lower]) as f64;
-            Ok((lower, upper, fraction))
-        }
-    }
-}
-
-fn lerp(a: f64, b: f64, fraction: f64) -> f64 {
-    a + (b - a) * fraction
-}
-
-impl AisCallback for TimingTable {
-    fn predict_prefill(&self, batch: usize, new: usize, cached: usize) -> Result<f64> {
-        let (b0, b1, bf) = bracket(&self.prefill_batch, batch)?;
-        let (n0, n1, nf) = bracket(&self.prefill_new, new)?;
-        let (c0, c1, cf) = bracket(&self.prefill_cached, cached)?;
-        let at =
-            |b: usize, n: usize| lerp(self.prefill_ms[b][n][c0], self.prefill_ms[b][n][c1], cf);
-        Ok(lerp(
-            lerp(at(b0, n0), at(b0, n1), nf),
-            lerp(at(b1, n0), at(b1, n1), nf),
-            bf,
-        ))
-    }
-
-    fn predict_decode(&self, batch: usize, context: usize, _osl: usize) -> Result<f64> {
-        let (b0, b1, bf) = bracket(&self.decode_batch, batch)?;
-        let (c0, c1, cf) = bracket(&self.decode_context, context)?;
-        Ok(lerp(
-            lerp(self.decode_ms[b0][c0], self.decode_ms[b0][c1], cf),
-            lerp(self.decode_ms[b1][c0], self.decode_ms[b1][c1], cf),
-            bf,
-        ))
-    }
-}
-
+/// Builds one role's engine config. When the role uses live AIS timing, also
+/// returns the resolved perf-model identity for `timing.json`.
 fn role_config(
     experiment: &Experiment,
     worker_type: WorkerType,
     base: &Path,
-) -> Result<MockerConfig> {
+) -> Result<(MockerConfig, Option<Value>)> {
     let mut engine = experiment.engine.clone();
     engine.extend(match worker_type {
         WorkerType::Prefill => experiment.prefill_engine.clone(),
@@ -168,32 +73,11 @@ fn role_config(
         serde_json::to_value(worker_type)?,
     );
     engine.insert("block_size".to_string(), json!(experiment.block_size));
-    let table = experiment
-        .timing_table
-        .as_ref()
-        .map(|path| -> Result<TimingTable> {
-            let table: TimingTable = serde_json::from_slice(&fs::read(base.join(path))?)?;
-            table.validate()?;
-            Ok(table)
-        })
-        .transpose()?;
-    if let Some(table) = &table {
-        engine.insert(
-            "timing_model".to_string(),
-            json!({
-                "type": "external", "provider": "ais", "config": {
-                    "model": table.model, "system": table.system,
-                    "backend": table.backend, "backend_version": table.backend_version,
-                    "worker_type": worker_type, "tp": table.tp
-                }
-            }),
-        );
-    }
-    let mut config = MockerConfig::from_value(json!({ "engine": engine }))?;
-    if let Some(table) = table {
-        config.perf_model = Arc::new(PerfModel::from_ais_callback(Arc::new(table)));
-    }
-    Ok(config)
+    ais_timing::inject_worker_type(&mut engine, worker_type)?;
+    ais_timing::resolve_systems_paths(&mut engine, base)?;
+    let mut args = MockerConfig::from_value(json!({ "engine": engine }))?;
+    let identity = ais_timing::install(&mut args)?;
+    Ok((args, identity))
 }
 
 fn percentile(sorted: &[f64], quantile: f64) -> Option<f64> {
@@ -216,13 +100,74 @@ fn stats(mut values: Vec<f64>) -> Value {
     })
 }
 
-/// Handoff time from source hold to destination activation. It equals the
-/// transfer time when the destination is reserved without waiting.
+/// Handoff time from source hold to destination activation. It is
+/// `reserve_wait_ms + transfer_ms`.
 fn handoff_ms(record: &PerRequestRecord) -> Option<f64> {
     Some(record.destination_activated_ms? - record.source_held_ms?)
 }
 
-fn write_outputs(out_dir: &Path, report: &TraceSimulationReport) -> Result<()> {
+/// Time a finished prefill waits for a decode destination to reserve memory.
+fn reserve_wait_ms(record: &PerRequestRecord) -> Option<f64> {
+    Some(record.destination_reserved_ms? - record.source_held_ms?)
+}
+
+/// Time the KV transfer spends on the NICs, from reservation to activation.
+fn transfer_ms(record: &PerRequestRecord) -> Option<f64> {
+    Some(record.destination_activated_ms? - record.destination_reserved_ms?)
+}
+
+/// Token-weighted achieved hit rates. `prefill` is the share of prompt tokens
+/// the prefill worker reused from its cache. `decode_destination` is the share
+/// the decode destination already held, so it did not have to receive them.
+/// Destinations count missing tokens in whole blocks, so a prompt counts as its
+/// block-rounded length there.
+/// Each row is `(input_length, reused_input_tokens, destination_missing_tokens)`.
+fn hit_rates(
+    rows: impl Iterator<Item = (usize, usize, Option<usize>)>,
+    block_size: usize,
+) -> Value {
+    let (mut input, mut reused) = (0usize, 0usize);
+    let (mut handed_off, mut missing) = (0usize, 0usize);
+    for (input_length, reused_tokens, missing_tokens) in rows {
+        input += input_length;
+        reused += reused_tokens;
+        if let Some(missing_tokens) = missing_tokens {
+            handed_off += input_length.div_ceil(block_size) * block_size;
+            missing += missing_tokens;
+        }
+    }
+    let share = |part: usize, whole: usize| (whole > 0).then(|| part as f64 / whole as f64);
+    json!({
+        "prefill": share(reused, input),
+        "decode_destination": share(missing, handed_off).map(|m| 1.0 - m),
+    })
+}
+
+/// Readmission totals per pool. A readmission is a preempt-and-readmit; the
+/// replay report has no direct preemption counter.
+fn readmissions<'a>(histories: impl Iterator<Item = &'a [PerRequestAdmissionRecord]>) -> Value {
+    let (mut prefill, mut decode, mut requests) = (0usize, 0usize, 0usize);
+    for history in histories {
+        let mut readmitted = false;
+        for admission in history.iter().filter(|a| a.is_readmission) {
+            readmitted = true;
+            match admission.pool {
+                ReplayRequestPool::Prefill => prefill += 1,
+                ReplayRequestPool::Decode => decode += 1,
+                ReplayRequestPool::Agg => {}
+            }
+        }
+        requests += usize::from(readmitted);
+    }
+    json!({ "prefill": prefill, "decode": decode, "requests_readmitted": requests })
+}
+
+fn write_outputs(
+    out_dir: &Path,
+    report: &TraceSimulationReport,
+    timing: Option<&Value>,
+    block_size: usize,
+) -> Result<()> {
     fs::create_dir_all(out_dir)
         .with_context(|| format!("failed to create {}", out_dir.display()))?;
     let mut records: Vec<&PerRequestRecord> = report.per_request.iter().collect();
@@ -245,11 +190,26 @@ fn write_outputs(out_dir: &Path, report: &TraceSimulationReport) -> Result<()> {
         "itl_ms": stats(records.iter().filter_map(|r| r.itl_ms).collect()),
         "e2e_ms": stats(records.iter().filter_map(|r| r.e2e_latency_ms).collect()),
         "handoff_ms": stats(records.iter().filter_map(|r| handoff_ms(r)).collect()),
+        "reserve_wait_ms": stats(records.iter().filter_map(|r| reserve_wait_ms(r)).collect()),
+        "transfer_ms": stats(records.iter().filter_map(|r| transfer_ms(r)).collect()),
+        "hit_rate": hit_rates(
+            records.iter().map(|r| {
+                (r.input_length, r.reused_input_tokens, r.destination_missing_tokens)
+            }),
+            block_size,
+        ),
+        "readmissions": readmissions(records.iter().map(|r| r.admission_history.as_slice())),
     });
     fs::write(
         out_dir.join("summary.json"),
         serde_json::to_string_pretty(&summary)? + "\n",
     )?;
+    if let Some(timing) = timing {
+        fs::write(
+            out_dir.join("timing.json"),
+            serde_json::to_string_pretty(timing)? + "\n",
+        )?;
+    }
     Ok(())
 }
 
@@ -266,9 +226,18 @@ fn main() -> Result<()> {
     )
     .context("invalid experiment file")?;
 
+    let (prefill_args, prefill_timing) = role_config(&experiment, WorkerType::Prefill, base)?;
+    let (decode_args, decode_timing) = role_config(&experiment, WorkerType::Decode, base)?;
+    let timing = (prefill_timing.is_some() || decode_timing.is_some()).then(|| {
+        json!({
+            "sources": ais_timing::source_identity(|key| std::env::var(key).ok()),
+            "prefill": prefill_timing,
+            "decode": decode_timing,
+        })
+    });
     let config = OfflineDisaggReplayConfig {
-        prefill_args: role_config(&experiment, WorkerType::Prefill, base)?,
-        decode_args: role_config(&experiment, WorkerType::Decode, base)?,
+        prefill_args,
+        decode_args,
         num_prefill_workers: experiment.num_prefill_workers,
         num_decode_workers: experiment.num_decode_workers,
     };
@@ -295,47 +264,85 @@ fn main() -> Result<()> {
         None,
         SlaThresholds::default(),
     )?;
-    write_outputs(&base.join(&experiment.out_dir), &report)
+    write_outputs(
+        &base.join(&experiment.out_dir),
+        &report,
+        timing.as_ref(),
+        experiment.block_size,
+    )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::TimingTable;
-    use dynamo_mocker::common::perf_model::AisCallback;
+    use super::*;
 
-    fn table() -> TimingTable {
-        TimingTable {
-            model: "test".into(),
-            system: "test".into(),
-            backend: "vllm".into(),
-            backend_version: "current".into(),
-            tp: 1,
-            prefill_batch: vec![1, 3],
-            prefill_new: vec![10, 30],
-            prefill_cached: vec![0, 20],
-            prefill_ms: vec![
-                vec![vec![10.0, 30.0], vec![30.0, 50.0]],
-                vec![vec![30.0, 50.0], vec![50.0, 70.0]],
-            ],
-            decode_batch: vec![1, 3],
-            decode_context: vec![10, 30],
-            decode_ms: vec![vec![10.0, 30.0], vec![30.0, 50.0]],
+    fn admission(pool: ReplayRequestPool, is_readmission: bool) -> PerRequestAdmissionRecord {
+        PerRequestAdmissionRecord {
+            admission_ordinal: 0,
+            pool_admission_ordinal: 0,
+            pool,
+            at_ms: 0.0,
+            reused_input_tokens: 0,
+            g1_reused_input_tokens: None,
+            host_reused_input_tokens: None,
+            is_readmission,
         }
     }
 
     #[test]
-    fn timing_table_interpolates_all_prefill_inputs() {
-        let table = table();
-        table.validate().unwrap();
-        assert_eq!(table.predict_prefill(2, 20, 10).unwrap(), 40.0);
-        assert_eq!(table.predict_decode(2, 20, 2).unwrap(), 30.0);
-        assert!(table.predict_prefill(2, 31, 10).is_err());
+    fn readmissions_count_per_pool_and_per_request() {
+        use ReplayRequestPool::{Decode, Prefill};
+        let clean = vec![admission(Prefill, false), admission(Decode, false)];
+        let preempted = vec![
+            admission(Prefill, false),
+            admission(Decode, false),
+            admission(Decode, true),
+            admission(Decode, true),
+        ];
+        let prefill_retry = vec![admission(Prefill, false), admission(Prefill, true)];
+        let histories = [clean, preempted, prefill_retry];
+        assert_eq!(
+            readmissions(histories.iter().map(Vec::as_slice)),
+            json!({"prefill": 1, "decode": 2, "requests_readmitted": 2})
+        );
     }
 
     #[test]
-    fn timing_table_rejects_malformed_grid() {
-        let mut table = table();
-        table.prefill_ms[0][0].pop();
-        assert!(table.validate().is_err());
+    fn no_readmissions_reports_zeros() {
+        assert_eq!(
+            readmissions(std::iter::empty()),
+            json!({"prefill": 0, "decode": 0, "requests_readmitted": 0})
+        );
+    }
+
+    #[test]
+    fn hit_rates_are_token_weighted() {
+        // At block size 512 the handed-off prompts span 1024 and 3072 tokens.
+        let rows = [
+            (1000, 500, Some(1024)),
+            (3000, 3000, Some(0)),
+            (1000, 0, None),
+        ];
+        assert_eq!(
+            hit_rates(rows.into_iter(), 512),
+            json!({"prefill": 0.7, "decode_destination": 0.75})
+        );
+    }
+
+    #[test]
+    fn cold_destination_has_zero_hit_rate_for_a_partial_last_block() {
+        let rows = [(1000, 0, Some(1024))];
+        assert_eq!(
+            hit_rates(rows.into_iter(), 512)["decode_destination"],
+            json!(0.0)
+        );
+    }
+
+    #[test]
+    fn hit_rates_without_tokens_are_null() {
+        assert_eq!(
+            hit_rates(std::iter::empty(), 512),
+            json!({"prefill": null, "decode_destination": null})
+        );
     }
 }
